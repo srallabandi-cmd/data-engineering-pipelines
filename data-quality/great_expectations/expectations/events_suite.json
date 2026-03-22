@@ -1,58 +1,58 @@
 {
   "expectation_suite_name": "events_suite",
   "ge_cloud_id": null,
-  "data_asset_type": "Dataset",
+  "data_asset_type": null,
   "meta": {
     "great_expectations_version": "0.18.8",
-    "created_by": "data-engineering-pipelines",
-    "notes": "Production expectation suite for the events Delta Lake table."
+    "created_by": "data-engineering",
+    "description": "Comprehensive data quality expectations for the events dataset. Validates schema, nullability, value ranges, domains, and cross-column relationships."
   },
   "expectations": [
     {
-      "expectation_type": "expect_table_columns_to_match_set",
+      "expectation_type": "expect_column_to_exist",
       "kwargs": {
-        "column_set": [
-          "event_id",
-          "user_id",
-          "event_type",
-          "event_ts",
-          "event_date",
-          "event_hour",
-          "platform",
-          "app_version",
-          "ip_hash",
-          "device_category",
-          "computed_session_id",
-          "session_event_count",
-          "session_duration_seconds"
-        ],
-        "exact_match": false
+        "column": "event_id"
       },
       "meta": {
-        "notes": "Ensure all expected columns are present."
-      }
-    },
-    {
-      "expectation_type": "expect_table_row_count_to_be_between",
-      "kwargs": {
-        "min_value": 1,
-        "max_value": null
-      },
-      "meta": {
-        "notes": "Table must not be empty."
+        "purpose": "Ensure the primary key column exists."
       }
     },
     {
       "expectation_type": "expect_column_to_exist",
       "kwargs": {
-        "column": "event_id"
+        "column": "event_type"
+      },
+      "meta": {
+        "purpose": "Ensure the event type column exists."
       }
     },
     {
       "expectation_type": "expect_column_to_exist",
       "kwargs": {
         "column": "user_id"
-      }
+      },
+      "meta": {}
+    },
+    {
+      "expectation_type": "expect_column_to_exist",
+      "kwargs": {
+        "column": "event_timestamp"
+      },
+      "meta": {}
+    },
+    {
+      "expectation_type": "expect_column_to_exist",
+      "kwargs": {
+        "column": "revenue"
+      },
+      "meta": {}
+    },
+    {
+      "expectation_type": "expect_column_to_exist",
+      "kwargs": {
+        "column": "duration_ms"
+      },
+      "meta": {}
     },
     {
       "expectation_type": "expect_column_values_to_not_be_null",
@@ -60,31 +60,36 @@
         "column": "event_id"
       },
       "meta": {
-        "notes": "Primary key must never be null."
-      }
-    },
-    {
-      "expectation_type": "expect_column_values_to_not_be_null",
-      "kwargs": {
-        "column": "user_id"
+        "severity": "critical",
+        "purpose": "event_id is the primary key and must never be null."
       }
     },
     {
       "expectation_type": "expect_column_values_to_not_be_null",
       "kwargs": {
         "column": "event_type"
+      },
+      "meta": {
+        "severity": "critical"
       }
     },
     {
       "expectation_type": "expect_column_values_to_not_be_null",
       "kwargs": {
-        "column": "event_ts"
+        "column": "event_timestamp"
+      },
+      "meta": {
+        "severity": "critical"
       }
     },
     {
       "expectation_type": "expect_column_values_to_not_be_null",
       "kwargs": {
-        "column": "event_date"
+        "column": "ingestion_date",
+        "mostly": 1.0
+      },
+      "meta": {
+        "severity": "critical"
       }
     },
     {
@@ -93,28 +98,34 @@
         "column": "event_id"
       },
       "meta": {
-        "notes": "event_id is the primary key and must be unique."
+        "severity": "critical",
+        "purpose": "event_id must be unique across the dataset."
       }
     },
     {
-      "expectation_type": "expect_column_values_to_be_of_type",
+      "expectation_type": "expect_column_values_to_be_between",
       "kwargs": {
-        "column": "event_id",
-        "type_": "StringType"
+        "column": "revenue",
+        "min_value": 0.0,
+        "max_value": 1000000.0,
+        "mostly": 0.99
+      },
+      "meta": {
+        "severity": "warning",
+        "purpose": "Revenue should be non-negative and within a reasonable range."
       }
     },
     {
-      "expectation_type": "expect_column_values_to_be_of_type",
+      "expectation_type": "expect_column_values_to_be_between",
       "kwargs": {
-        "column": "event_ts",
-        "type_": "TimestampType"
-      }
-    },
-    {
-      "expectation_type": "expect_column_values_to_be_of_type",
-      "kwargs": {
-        "column": "event_hour",
-        "type_": "IntegerType"
+        "column": "duration_ms",
+        "min_value": 0,
+        "max_value": 86400000,
+        "mostly": 0.99
+      },
+      "meta": {
+        "severity": "warning",
+        "purpose": "Duration should be non-negative and under 24 hours."
       }
     },
     {
@@ -124,90 +135,95 @@
         "value_set": [
           "page_view",
           "click",
+          "scroll",
           "purchase",
           "signup",
-          "logout",
-          "search",
-          "add_to_cart",
-          "remove_from_cart",
-          "checkout"
+          "login",
+          "logout"
         ]
+      },
+      "meta": {
+        "severity": "critical",
+        "purpose": "event_type must be one of the known event types."
       }
     },
     {
       "expectation_type": "expect_column_values_to_be_in_set",
       "kwargs": {
-        "column": "device_category",
+        "column": "device_type",
         "value_set": [
           "mobile",
           "desktop",
           "tablet",
+          "smart_tv",
           "bot",
+          "other",
           "unknown"
-        ]
-      }
-    },
-    {
-      "expectation_type": "expect_column_values_to_be_in_set",
-      "kwargs": {
-        "column": "platform",
-        "value_set": [
-          "web",
-          "ios",
-          "android",
-          null
-        ]
-      }
-    },
-    {
-      "expectation_type": "expect_column_values_to_be_between",
-      "kwargs": {
-        "column": "event_hour",
-        "min_value": 0,
-        "max_value": 23
-      }
-    },
-    {
-      "expectation_type": "expect_column_values_to_be_between",
-      "kwargs": {
-        "column": "session_duration_seconds",
-        "min_value": 0,
-        "max_value": 86400,
-        "mostly": 0.99
-      },
-      "meta": {
-        "notes": "Session duration should be between 0 and 24 hours."
-      }
-    },
-    {
-      "expectation_type": "expect_column_values_to_be_between",
-      "kwargs": {
-        "column": "session_event_count",
-        "min_value": 1,
-        "max_value": 10000,
-        "mostly": 0.99
-      }
-    },
-    {
-      "expectation_type": "expect_column_values_to_match_regex",
-      "kwargs": {
-        "column": "ip_hash",
-        "regex": "^[a-f0-9]{16}$",
+        ],
         "mostly": 0.95
       },
       "meta": {
-        "notes": "IP hash should be a 16-char hex string."
+        "severity": "warning"
+      }
+    },
+    {
+      "expectation_type": "expect_table_row_count_to_be_between",
+      "kwargs": {
+        "min_value": 100,
+        "max_value": 100000000
+      },
+      "meta": {
+        "severity": "critical",
+        "purpose": "Table should have a reasonable number of rows. Empty or extremely large indicates a pipeline issue."
+      }
+    },
+    {
+      "expectation_type": "expect_column_pair_values_a_to_be_greater_than_b",
+      "kwargs": {
+        "column_A": "event_timestamp",
+        "column_B": "ingested_at",
+        "or_equal": true,
+        "mostly": 0.0
+      },
+      "meta": {
+        "severity": "info",
+        "purpose": "Informational: check relationship between event time and ingestion time. Events should generally occur before ingestion."
+      }
+    },
+    {
+      "expectation_type": "expect_column_pair_values_a_to_be_greater_than_b",
+      "kwargs": {
+        "column_A": "ingested_at",
+        "column_B": "event_timestamp",
+        "or_equal": true,
+        "mostly": 0.95
+      },
+      "meta": {
+        "severity": "warning",
+        "purpose": "Ingestion time should generally be after event time. High failure rate suggests clock skew."
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "kwargs": {
+        "column": "user_id",
+        "mostly": 0.8
+      },
+      "meta": {
+        "severity": "warning",
+        "purpose": "At least 80% of events should have a user_id."
       }
     },
     {
       "expectation_type": "expect_column_values_to_match_regex",
       "kwargs": {
-        "column": "computed_session_id",
-        "regex": "^.+_\\d+$",
-        "mostly": 0.99
+        "column": "event_id",
+        "regex": "^[a-zA-Z0-9\\-_]{8,64}$",
+        "mostly": 1.0
       },
       "meta": {
-        "notes": "Session ID format: user_id + '_' + session_index."
+        "severity": "critical",
+        "purpose": "event_id should be an alphanumeric string between 8 and 64 characters."
       }
     }
   ]

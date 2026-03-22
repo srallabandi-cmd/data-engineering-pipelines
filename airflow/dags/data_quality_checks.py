@@ -1,316 +1,460 @@
 """
 Data Quality Checks DAG
-========================
 
-Standalone DAG for running data quality checks across all critical tables.
-Uses Great Expectations and custom quality checks with branching logic:
-- If all checks pass: generate a summary report and notify success.
-- If any check fails: send an alert and optionally quarantine bad data.
+Runs comprehensive data quality validations after the daily ETL pipeline:
+1. Great Expectations checkpoint execution
+2. SQL-based quality checks (nulls, ranges, referential integrity)
+3. Data freshness checks
+4. Volume anomaly detection (comparison to historical averages)
+5. Alert on any failures via Slack
 
-Schedule: Daily at 08:00 UTC (runs after the main ETL pipeline completes)
+Schedule: Triggered after daily_etl_pipeline or at 10:00 UTC daily
 """
 
-import json
-import logging
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from airflow import DAG
 from airflow.models import Variable
-from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.operators.bash import BashOperator
+from airflow.operators.empty import EmptyOperator
 from airflow.providers.slack.operators.slack_webhook import SlackWebhookOperator
+from airflow.sensors.external_task import ExternalTaskSensor
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SLACK_CONN_ID = Variable.get("slack_conn_id", default_var="slack_default")
-WAREHOUSE_BASE = Variable.get("warehouse_base", default_var="s3a://data-warehouse")
-GE_ROOT = "/opt/data-quality/great_expectations"
-
-TABLES_TO_CHECK = [
-    {"name": "events", "path": f"{WAREHOUSE_BASE}/events", "suite": "events_suite"},
-    {"name": "users", "path": f"{WAREHOUSE_BASE}/users", "suite": "users_suite"},
-    {"name": "sessions", "path": f"{WAREHOUSE_BASE}/sessions", "suite": "sessions_suite"},
-]
-
+DAG_ID = "data_quality_checks"
+SLACK_WEBHOOK_CONN_ID = "slack_webhook"
+S3_BUCKET = Variable.get("s3_data_bucket", default_var="data-lake")
+WAREHOUSE_PATH = Variable.get("warehouse_path", default_var="s3a://data-lake/warehouse")
+GE_PROJECT_DIR = Variable.get(
+    "great_expectations_dir",
+    default_var="/opt/data-quality/great_expectations",
+)
+FRESHNESS_THRESHOLD_HOURS = int(Variable.get("freshness_threshold_hours", default_var="6"))
+VOLUME_ANOMALY_STDDEV = float(Variable.get("volume_anomaly_stddev", default_var="2.0"))
 
 # ---------------------------------------------------------------------------
-# Task callables
+# Task Callables
 # ---------------------------------------------------------------------------
 
-
-def run_ge_checkpoint(table_config: Dict[str, str], **context) -> Dict[str, Any]:
-    """Run a Great Expectations checkpoint for a single table.
-
-    Returns a result dict pushed via XCom.
+def run_great_expectations_checkpoint(**context) -> Dict[str, Any]:
     """
-    import subprocess
+    Execute a Great Expectations checkpoint for the events dataset.
 
-    table_name = table_config["name"]
-    suite_name = table_config["suite"]
+    Returns the validation result summary and pushes pass/fail to XCom.
+    """
+    import great_expectations as gx
+    import json
 
-    logger.info("Running GE checkpoint for table=%s suite=%s", table_name, suite_name)
+    execution_date = context["ds"]
 
-    result = subprocess.run(
-        [
-            "python", "-m", "great_expectations",
-            "checkpoint", "run", f"{table_name}_checkpoint",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=GE_ROOT,
+    ge_context = gx.get_context(context_root_dir=GE_PROJECT_DIR)
+
+    checkpoint_result = ge_context.run_checkpoint(
+        checkpoint_name="daily_checkpoint",
+        batch_request={
+            "runtime_parameters": {
+                "query": f"""
+                    SELECT * FROM events
+                    WHERE ingestion_date = '{execution_date}'
+                """
+            },
+            "batch_identifiers": {
+                "execution_date": execution_date,
+            },
+        },
     )
 
-    check_result = {
-        "table": table_name,
-        "suite": suite_name,
-        "passed": result.returncode == 0,
-        "stdout": result.stdout[-1000:] if result.stdout else "",
-        "stderr": result.stderr[-500:] if result.stderr else "",
+    success = checkpoint_result.success
+    statistics = checkpoint_result.statistics
+
+    result = {
+        "success": success,
+        "evaluated_expectations": statistics.get("evaluated_expectations", 0),
+        "successful_expectations": statistics.get("successful_expectations", 0),
+        "unsuccessful_expectations": statistics.get("unsuccessful_expectations", 0),
     }
 
-    context["task_instance"].xcom_push(
-        key=f"quality_{table_name}", value=json.dumps(check_result)
-    )
-    return check_result
+    context["task_instance"].xcom_push(key="ge_result", value=json.dumps(result))
+    context["task_instance"].xcom_push(key="ge_success", value=success)
+
+    if not success:
+        raise ValueError(
+            f"Great Expectations checkpoint failed: "
+            f"{result['unsuccessful_expectations']} expectations did not pass."
+        )
+
+    return result
 
 
-def run_custom_quality_checks(table_config: Dict[str, str], **context) -> Dict[str, Any]:
-    """Run custom PySpark-based quality checks for a single table."""
-    from pyspark.sql import SparkSession
+def run_sql_quality_checks(**context) -> Dict[str, Any]:
+    """
+    Execute SQL-based quality checks against the warehouse.
 
-    table_name = table_config["name"]
-    table_path = table_config["path"]
+    Checks:
+    - Critical column nullability
+    - Primary key uniqueness
+    - Foreign key referential integrity
+    - Value domain validation
+    """
+    import json
+    import sys
+    sys.path.insert(0, "/opt/spark-jobs/utils")
 
-    spark = SparkSession.builder.appName(f"dq_{table_name}").getOrCreate()
+    from spark_session import SparkSessionBuilder
+    from pyspark.sql import functions as F
+
+    execution_date = context["ds"]
+    spark = SparkSessionBuilder(app_name="DQ_SQLChecks").with_delta().with_s3().build()
+
+    results = []
+    all_passed = True
 
     try:
-        df = spark.read.format("delta").load(table_path)
-        total_rows = df.count()
+        events_df = spark.read.format("delta").load(f"{WAREHOUSE_PATH}/events")
+        daily_events = events_df.filter(F.col("ingestion_date") == execution_date)
+        daily_events.createOrReplaceTempView("events")
 
-        # Basic checks
-        from pyspark.sql import functions as F
+        checks = [
+            {
+                "name": "event_id_not_null",
+                "sql": "SELECT COUNT(*) AS result FROM events WHERE event_id IS NULL",
+                "expected": 0,
+                "operator": "eq",
+                "severity": "critical",
+            },
+            {
+                "name": "event_id_unique",
+                "sql": """
+                    SELECT COUNT(*) AS result FROM (
+                        SELECT event_id, COUNT(*) AS cnt
+                        FROM events
+                        GROUP BY event_id
+                        HAVING cnt > 1
+                    )
+                """,
+                "expected": 0,
+                "operator": "eq",
+                "severity": "critical",
+            },
+            {
+                "name": "revenue_non_negative",
+                "sql": "SELECT COUNT(*) AS result FROM events WHERE revenue < 0",
+                "expected": 0,
+                "operator": "eq",
+                "severity": "critical",
+            },
+            {
+                "name": "valid_event_types",
+                "sql": """
+                    SELECT COUNT(*) AS result FROM events
+                    WHERE event_type NOT IN (
+                        'page_view', 'click', 'scroll', 'purchase',
+                        'signup', 'login', 'logout'
+                    )
+                """,
+                "expected": 0,
+                "operator": "eq",
+                "severity": "warning",
+            },
+            {
+                "name": "timestamp_not_future",
+                "sql": "SELECT COUNT(*) AS result FROM events WHERE event_timestamp > current_timestamp()",
+                "expected": 0,
+                "operator": "eq",
+                "severity": "warning",
+            },
+        ]
 
-        checks = {}
+        for check in checks:
+            try:
+                result_df = spark.sql(check["sql"])
+                actual = result_df.collect()[0]["result"]
 
-        # Row count check — must have data
-        checks["row_count"] = total_rows > 0
+                if check["operator"] == "eq":
+                    passed = actual == check["expected"]
+                elif check["operator"] == "lte":
+                    passed = actual <= check["expected"]
+                else:
+                    passed = actual == check["expected"]
 
-        # Null checks on key columns
-        if table_name == "events":
-            null_event_id = df.filter(F.col("event_id").isNull()).count()
-            null_user_id = df.filter(F.col("user_id").isNull()).count()
-            checks["no_null_event_id"] = null_event_id == 0
-            checks["no_null_user_id"] = null_user_id == 0
+                if not passed and check["severity"] == "critical":
+                    all_passed = False
 
-            # Freshness check — most recent event should be within 24h
-            max_ts = df.agg(F.max("event_ts")).collect()[0][0]
-            if max_ts:
-                from datetime import timezone as tz
-                age_hours = (datetime.now(tz.utc) - max_ts.replace(tzinfo=tz.utc)).total_seconds() / 3600
-                checks["data_freshness_24h"] = age_hours <= 24
+                results.append({
+                    "name": check["name"],
+                    "passed": passed,
+                    "expected": check["expected"],
+                    "actual": actual,
+                    "severity": check["severity"],
+                })
+            except Exception as exc:
+                results.append({
+                    "name": check["name"],
+                    "passed": False,
+                    "expected": check["expected"],
+                    "actual": f"ERROR: {str(exc)}",
+                    "severity": check["severity"],
+                })
+                if check["severity"] == "critical":
+                    all_passed = False
 
-            # Uniqueness
-            distinct_events = df.select("event_id").distinct().count()
-            checks["event_id_unique"] = distinct_events == total_rows
+        context["task_instance"].xcom_push(key="sql_check_results", value=json.dumps(results))
+        context["task_instance"].xcom_push(key="sql_checks_passed", value=all_passed)
 
-        all_passed = all(checks.values())
+        if not all_passed:
+            failed = [r for r in results if not r["passed"] and r["severity"] == "critical"]
+            raise ValueError(
+                f"SQL quality checks failed: {len(failed)} critical failures. "
+                f"Details: {json.dumps(failed)}"
+            )
+
+        return {"checks": len(results), "all_passed": all_passed}
+
+    finally:
+        spark.stop()
+
+
+def check_data_freshness(**context) -> Dict[str, Any]:
+    """
+    Verify that data is fresh enough (within the threshold).
+
+    Compares the most recent event timestamp against the current time.
+    """
+    import json
+    import sys
+    sys.path.insert(0, "/opt/spark-jobs/utils")
+
+    from spark_session import SparkSessionBuilder
+    from pyspark.sql import functions as F
+
+    spark = SparkSessionBuilder(app_name="DQ_Freshness").with_delta().with_s3().build()
+
+    try:
+        events_df = spark.read.format("delta").load(f"{WAREHOUSE_PATH}/events")
+
+        max_ts_row = events_df.agg(F.max("event_timestamp").alias("max_ts")).collect()[0]
+        max_ts = max_ts_row["max_ts"]
+
+        if max_ts is None:
+            raise ValueError("No events found in warehouse.")
+
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        age_hours = (now - max_ts.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+
+        is_fresh = age_hours <= FRESHNESS_THRESHOLD_HOURS
 
         result = {
-            "table": table_name,
-            "total_rows": total_rows,
-            "checks": checks,
-            "all_passed": all_passed,
+            "most_recent_event": str(max_ts),
+            "age_hours": round(age_hours, 2),
+            "threshold_hours": FRESHNESS_THRESHOLD_HOURS,
+            "is_fresh": is_fresh,
         }
 
-        context["task_instance"].xcom_push(
-            key=f"custom_quality_{table_name}", value=json.dumps(result, default=str)
-        )
+        context["task_instance"].xcom_push(key="freshness_result", value=json.dumps(result))
+
+        if not is_fresh:
+            raise ValueError(
+                f"Data is stale: last event was {age_hours:.1f} hours ago "
+                f"(threshold: {FRESHNESS_THRESHOLD_HOURS}h)."
+            )
+
         return result
 
     finally:
         spark.stop()
 
 
-def evaluate_results(**context) -> str:
-    """Evaluate all quality check results and branch accordingly.
-
-    Returns the downstream task_id to follow.
+def detect_volume_anomalies(**context) -> Dict[str, Any]:
     """
+    Detect volume anomalies by comparing today's count against
+    the historical average and standard deviation.
+    """
+    import json
+    import sys
+    sys.path.insert(0, "/opt/spark-jobs/utils")
+
+    from spark_session import SparkSessionBuilder
+    from pyspark.sql import functions as F
+
+    execution_date = context["ds"]
+    spark = SparkSessionBuilder(app_name="DQ_VolumeAnomaly").with_delta().with_s3().build()
+
+    try:
+        events_df = spark.read.format("delta").load(f"{WAREHOUSE_PATH}/events")
+
+        # Today's count
+        today_count = events_df.filter(F.col("ingestion_date") == execution_date).count()
+
+        # Historical stats (last 30 days excluding today)
+        historical_stats = (
+            events_df
+            .filter(
+                (F.col("ingestion_date") < execution_date) &
+                (F.col("ingestion_date") >= F.date_sub(F.lit(execution_date), 30))
+            )
+            .groupBy("ingestion_date")
+            .agg(F.count("*").alias("daily_count"))
+            .agg(
+                F.mean("daily_count").alias("avg_count"),
+                F.stddev("daily_count").alias("stddev_count"),
+            )
+            .collect()[0]
+        )
+
+        avg_count = historical_stats["avg_count"] or 0
+        stddev_count = historical_stats["stddev_count"] or 0
+
+        lower_bound = max(0, avg_count - (VOLUME_ANOMALY_STDDEV * stddev_count))
+        upper_bound = avg_count + (VOLUME_ANOMALY_STDDEV * stddev_count)
+
+        is_anomaly = today_count < lower_bound or today_count > upper_bound
+
+        result = {
+            "today_count": today_count,
+            "avg_count": round(avg_count, 0),
+            "stddev_count": round(stddev_count, 0),
+            "lower_bound": round(lower_bound, 0),
+            "upper_bound": round(upper_bound, 0),
+            "is_anomaly": is_anomaly,
+        }
+
+        context["task_instance"].xcom_push(key="volume_result", value=json.dumps(result))
+
+        if is_anomaly:
+            raise ValueError(
+                f"Volume anomaly detected: {today_count} events today "
+                f"(expected {lower_bound:.0f}-{upper_bound:.0f})."
+            )
+
+        return result
+
+    finally:
+        spark.stop()
+
+
+def decide_alert_path(**context) -> str:
+    """Branch: decide whether to send alert or skip based on check results."""
     ti = context["task_instance"]
-    all_passed = True
 
-    for table_config in TABLES_TO_CHECK:
-        table_name = table_config["name"]
+    ge_success = ti.xcom_pull(task_ids="ge_checkpoint.run_great_expectations", key="ge_success")
+    sql_passed = ti.xcom_pull(task_ids="sql_checks.run_sql_quality_checks", key="sql_checks_passed")
 
-        ge_result_raw = ti.xcom_pull(
-            task_ids=f"ge_checks.ge_check_{table_name}",
-            key=f"quality_{table_name}",
-        )
-        custom_result_raw = ti.xcom_pull(
-            task_ids=f"custom_checks.custom_check_{table_name}",
-            key=f"custom_quality_{table_name}",
-        )
-
-        if ge_result_raw:
-            ge_result = json.loads(ge_result_raw)
-            if not ge_result.get("passed", False):
-                all_passed = False
-                logger.warning("GE check failed for %s", table_name)
-
-        if custom_result_raw:
-            custom_result = json.loads(custom_result_raw)
-            if not custom_result.get("all_passed", False):
-                all_passed = False
-                logger.warning("Custom check failed for %s", table_name)
-
-    if all_passed:
-        logger.info("All quality checks passed")
-        return "notify_success"
-    else:
-        logger.warning("Quality checks failed — routing to failure handler")
-        return "handle_failure"
-
-
-def generate_quality_report(**context) -> str:
-    """Generate a consolidated quality report and store it."""
-    ti = context["task_instance"]
-    execution_date = context["ds"]
-    report_sections: List[Dict] = []
-
-    for table_config in TABLES_TO_CHECK:
-        table_name = table_config["name"]
-        custom_raw = ti.xcom_pull(
-            task_ids=f"custom_checks.custom_check_{table_name}",
-            key=f"custom_quality_{table_name}",
-        )
-        if custom_raw:
-            report_sections.append(json.loads(custom_raw))
-
-    report = {
-        "execution_date": execution_date,
-        "generated_at": datetime.utcnow().isoformat(),
-        "tables": report_sections,
-        "overall_status": "passed" if all(
-            s.get("all_passed", False) for s in report_sections
-        ) else "failed",
-    }
-
-    report_json = json.dumps(report, indent=2, default=str)
-    logger.info("Quality Report:\n%s", report_json)
-    ti.xcom_push(key="quality_report", value=report_json)
-    return report_json
-
-
-def handle_failure_notification(**context) -> None:
-    """Send detailed failure notification via Slack."""
-    execution_date = context["ds"]
-    message = (
-        f":red_circle: *Data Quality Checks Failed*\n"
-        f"*Date:* {execution_date}\n"
-        f"*Action Required:* Review quality reports in Airflow logs and quarantine affected data.\n"
-        f"*Dashboard:* <http://airflow:8080/dags/data_quality_checks|View DAG>"
-    )
-    SlackWebhookOperator(
-        task_id="slack_failure",
-        slack_webhook_conn_id=SLACK_CONN_ID,
-        message=message,
-    ).execute(context=context)
-
-
-def send_success_notification(**context) -> None:
-    """Send success notification via Slack."""
-    execution_date = context["ds"]
-    message = (
-        f":white_check_mark: *Data Quality Checks Passed*\n"
-        f"*Date:* {execution_date}\n"
-        f"All tables validated successfully."
-    )
-    SlackWebhookOperator(
-        task_id="slack_success",
-        slack_webhook_conn_id=SLACK_CONN_ID,
-        message=message,
-    ).execute(context=context)
+    if ge_success and sql_passed:
+        return "notify_all_passed"
+    return "notify_failures"
 
 
 # ---------------------------------------------------------------------------
-# DAG definition
+# DAG Definition
 # ---------------------------------------------------------------------------
 default_args = {
     "owner": "data-engineering",
     "depends_on_past": False,
+    "email": ["data-alerts@example.com"],
+    "email_on_failure": True,
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
-    "email": ["data-engineering@example.com"],
-    "email_on_failure": True,
-    "email_on_retry": False,
+    "execution_timeout": timedelta(hours=1),
+    "on_failure_callback": None,
 }
 
 with DAG(
-    dag_id="data_quality_checks",
+    dag_id=DAG_ID,
     default_args=default_args,
-    description="Standalone data quality validation across all warehouse tables",
-    schedule_interval="0 8 * * *",
+    description="Post-ETL data quality checks: GE, SQL, freshness, and volume anomaly detection.",
+    schedule_interval="0 10 * * *",
     start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
-    tags=["quality", "production", "daily"],
+    tags=["data-quality", "daily", "production"],
     doc_md=__doc__,
 ) as dag:
 
-    # -- Great Expectations checks -----------------------------------------
-    with TaskGroup("ge_checks", tooltip="Great Expectations validations") as ge_checks:
-        for table_cfg in TABLES_TO_CHECK:
-            PythonOperator(
-                task_id=f"ge_check_{table_cfg['name']}",
-                python_callable=run_ge_checkpoint,
-                op_kwargs={"table_config": table_cfg},
-                provide_context=True,
-            )
+    # ---- Wait for ETL completion ----
+    wait_for_etl = ExternalTaskSensor(
+        task_id="wait_for_daily_etl",
+        external_dag_id="daily_etl_pipeline",
+        external_task_id=None,  # Wait for entire DAG
+        execution_delta=timedelta(hours=4),  # ETL runs at 06:00, this at 10:00
+        poke_interval=300,
+        timeout=3600,
+        mode="reschedule",
+    )
 
-    # -- Custom PySpark checks ---------------------------------------------
-    with TaskGroup("custom_checks", tooltip="Custom PySpark quality checks") as custom_checks:
-        for table_cfg in TABLES_TO_CHECK:
-            PythonOperator(
-                task_id=f"custom_check_{table_cfg['name']}",
-                python_callable=run_custom_quality_checks,
-                op_kwargs={"table_config": table_cfg},
-                provide_context=True,
-            )
+    # ---- Great Expectations ----
+    with TaskGroup(group_id="ge_checkpoint") as ge_group:
+        run_ge = PythonOperator(
+            task_id="run_great_expectations",
+            python_callable=run_great_expectations_checkpoint,
+            provide_context=True,
+        )
 
-    # -- Report generation -------------------------------------------------
-    generate_report = PythonOperator(
-        task_id="generate_quality_report",
-        python_callable=generate_quality_report,
+    # ---- SQL Checks ----
+    with TaskGroup(group_id="sql_checks") as sql_group:
+        sql_checks = PythonOperator(
+            task_id="run_sql_quality_checks",
+            python_callable=run_sql_quality_checks,
+            provide_context=True,
+        )
+
+    # ---- Freshness ----
+    freshness_check = PythonOperator(
+        task_id="check_data_freshness",
+        python_callable=check_data_freshness,
         provide_context=True,
     )
 
-    # -- Branch based on results -------------------------------------------
-    branch = BranchPythonOperator(
-        task_id="evaluate_results",
-        python_callable=evaluate_results,
+    # ---- Volume Anomaly ----
+    volume_anomaly = PythonOperator(
+        task_id="detect_volume_anomalies",
+        python_callable=detect_volume_anomalies,
         provide_context=True,
     )
 
-    # -- Success path ------------------------------------------------------
-    notify_success = PythonOperator(
-        task_id="notify_success",
-        python_callable=send_success_notification,
+    # ---- Branching ----
+    decide_alert = BranchPythonOperator(
+        task_id="decide_alert_path",
+        python_callable=decide_alert_path,
         provide_context=True,
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
-    # -- Failure path ------------------------------------------------------
-    handle_failure = PythonOperator(
-        task_id="handle_failure",
-        python_callable=handle_failure_notification,
-        provide_context=True,
+    # ---- Notifications ----
+    notify_all_passed = SlackWebhookOperator(
+        task_id="notify_all_passed",
+        slack_webhook_conn_id=SLACK_WEBHOOK_CONN_ID,
+        message=(
+            ":white_check_mark: *Data Quality Checks Passed*\n"
+            "*Date:* `{{ ds }}`\n"
+            "All Great Expectations, SQL, freshness, and volume checks passed."
+        ),
     )
 
-    # -- Dependencies ------------------------------------------------------
-    [ge_checks, custom_checks] >> generate_report >> branch
-    branch >> notify_success
-    branch >> handle_failure
+    notify_failures = SlackWebhookOperator(
+        task_id="notify_failures",
+        slack_webhook_conn_id=SLACK_WEBHOOK_CONN_ID,
+        message=(
+            ":warning: *Data Quality Issues Detected*\n"
+            "*Date:* `{{ ds }}`\n"
+            "One or more quality checks failed. Review the Airflow logs for details."
+        ),
+    )
+
+    done = EmptyOperator(
+        task_id="done",
+        trigger_rule=TriggerRule.ONE_SUCCESS,
+    )
+
+    # ---- Dependencies ----
+    wait_for_etl >> [ge_group, sql_group, freshness_check, volume_anomaly]
+    [ge_group, sql_group, freshness_check, volume_anomaly] >> decide_alert
+    decide_alert >> [notify_all_passed, notify_failures]
+    [notify_all_passed, notify_failures] >> done

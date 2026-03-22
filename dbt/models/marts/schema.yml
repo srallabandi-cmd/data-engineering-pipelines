@@ -3,102 +3,131 @@ version: 2
 models:
   - name: dim_users
     description: >
-      User dimension table with latest profile attributes, lifetime engagement
-      metrics, and user segmentation. Implements SCD Type 2 with valid_from
-      and valid_to columns. Filter on is_current = true for the latest snapshot.
+      User dimension table implementing SCD Type 2 for historical tracking.
+      Each user may have multiple records representing different versions
+      of their attributes over time. The is_current flag identifies the
+      active version.
     columns:
-      - name: user_key
-        description: Surrogate key combining user_id and valid_from for SCD Type 2.
+      - name: user_sk
+        description: "Surrogate key for the dimension record (unique across versions)."
         tests:
+          - not_null
           - unique
-          - not_null
-
       - name: user_id
-        description: Natural key — unique user identifier.
+        description: "Natural business key for the user."
         tests:
           - not_null
-
-      - name: email
-        description: Normalised user email address.
+      - name: username
+        description: "User-selected display name."
+      - name: first_name
+        description: "User first name."
+      - name: last_name
+        description: "User last name."
+      - name: email_hash
+        description: "SHA-256 hash of user email (PII protected)."
         tests:
           - not_null
-
-      - name: signed_up_at
-        description: Date the user signed up.
+      - name: user_status
+        description: "Current account status: active, inactive, suspended, deleted, pending."
         tests:
           - not_null
-
-      - name: plan_type
-        description: Subscription plan (free, pro, enterprise).
-        tests:
           - accepted_values:
-              values: ['free', 'pro', 'enterprise']
-
+              values:
+                - active
+                - inactive
+                - suspended
+                - deleted
+                - pending
+                - unknown
       - name: user_segment
-        description: >
-          Computed user segment based on engagement metrics:
-          power_user, regular, casual, dormant.
+        description: "Business segment classification."
+      - name: country
+        description: "User country."
+      - name: lifetime_value
+        description: "Cumulative monetary value of the user."
         tests:
-          - accepted_values:
-              values: ['power_user', 'regular', 'casual', 'dormant']
-
-      - name: lifetime_event_count
-        description: Total number of events triggered by this user.
-        tests:
-          - not_null
-
-      - name: lifetime_session_count
-        description: Total number of sessions for this user.
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: true
+      - name: valid_from
+        description: "Start of the validity period for this version."
         tests:
           - not_null
-
+      - name: valid_to
+        description: "End of validity period (null for current record)."
       - name: is_current
-        description: Whether this is the current version of the user record.
+        description: "True if this is the active version of the user record."
         tests:
           - not_null
 
   - name: fct_events
     description: >
-      Events fact table at the individual event grain. Each row represents
-      a single deduplicated event enriched with user dimension attributes
-      and session context. Use event_date for time-based filtering.
+      Fact table at the event grain. One row per user interaction event.
+      Contains foreign keys to dim_users (user_sk) and session context.
+      Includes measures (duration, revenue) and degenerate dimensions
+      (event_type, device, geo). Partitioned by event_date.
     columns:
       - name: event_id
-        description: Unique event identifier.
+        description: "Unique event identifier (primary key)."
         tests:
+          - not_null
           - unique
-          - not_null
-
-      - name: user_id
-        description: User who triggered the event.
+      - name: user_sk
+        description: "Foreign key to dim_users (current user version)."
         tests:
           - not_null
-
-      - name: event_type
-        description: Type of event.
-        tests:
-          - not_null
-
-      - name: event_at
-        description: UTC timestamp of the event.
-        tests:
-          - not_null
-
-      - name: event_date
-        description: Date of the event (for partitioning and filtering).
-        tests:
-          - not_null
-
+          - relationships:
+              to: ref('dim_users')
+              field: user_sk
+              severity: warn
       - name: session_id
-        description: Session the event belongs to (from sessionisation logic).
-
-      - name: user_plan_type
-        description: User subscription plan at the time of the event.
-
-      - name: user_segment
-        description: User engagement segment at the time of the event.
-
-      - name: is_first_event
-        description: Whether this is the user's very first event.
+        description: "Session the event belongs to (may be null for anonymous users)."
+      - name: event_type
+        description: "Type of event."
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - page_view
+                - click
+                - scroll
+                - purchase
+                - signup
+                - login
+                - logout
+      - name: event_timestamp
+        description: "When the event occurred (UTC)."
+        tests:
+          - not_null
+      - name: event_date
+        description: "Date of the event (partition key)."
+        tests:
+          - not_null
+      - name: duration_ms
+        description: "Duration of the event in milliseconds."
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: true
+      - name: revenue
+        description: "Revenue associated with the event."
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: true
+      - name: is_conversion
+        description: "Whether the event represents a conversion."
+        tests:
+          - not_null
+      - name: event_sequence_in_session
+        description: "Ordinal position of the event within its session."
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 1
+              inclusive: true
+      - name: dbt_updated_at
+        description: "Timestamp when this record was last updated by dbt."
         tests:
           - not_null

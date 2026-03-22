@@ -1,69 +1,139 @@
+# =========================
 # Python
-__pycache__/
+# =========================
 *.py[cod]
 *$py.class
+__pycache__/
 *.so
-*.egg-info/
 *.egg
+*.egg-info/
 dist/
 build/
-.eggs/
+eggs/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+.Python
+develop-eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+
+# =========================
+# Virtual Environments
+# =========================
+.env
+.env.*
 .venv/
 venv/
+ENV/
 env/
-.python-version
 
-# PySpark
-metastore_db/
+# =========================
+# Spark
+# =========================
 spark-warehouse/
+metastore_db/
 derby.log
+*.jar
+*.class
+local-*.log
 
-# Delta Lake
-_delta_log/
+# =========================
+# Airflow
+# =========================
+airflow/logs/
+airflow/airflow.db
+airflow/airflow.cfg
+airflow/unittests.cfg
+airflow/webserver_config.py
+logs/
+*.pid
 
+# =========================
 # dbt
+# =========================
+target/
+dbt_packages/
+dbt_modules/
+dbt/logs/
 dbt/target/
 dbt/dbt_packages/
-dbt/logs/
-dbt/dbt_modules/
 
+# =========================
 # Great Expectations
+# =========================
 data-quality/great_expectations/uncommitted/
 data-quality/great_expectations/great_expectations.yml
 
-# Airflow
-airflow/logs/
-*.pid
+# =========================
+# Delta Lake
+# =========================
+_delta_log/
+*.crc
 
-# IDE
+# =========================
+# IDE / Editor
+# =========================
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
+.project
+.classpath
+.settings/
 
+# =========================
 # OS
+# =========================
 .DS_Store
 Thumbs.db
+*.tmp
+*.bak
 
-# Environment
-.env
-.env.*
-!.env.example
+# =========================
+# Docker
+# =========================
+docker-compose.override.yml
 
-# Credentials
-*.pem
-*.key
-credentials.json
+# =========================
+# Terraform
+# =========================
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
 
-# Test / Coverage
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Testing / Coverage
+# =========================
 .coverage
 htmlcov/
 .pytest_cache/
-reports/
+.tox/
+.nox/
+coverage.xml
+*.cover
 
-# Jupyter
-.ipynb_checkpoints/
-
-# Docker
-*.log
+# =========================
+# Data (do not commit raw data)
+# =========================
+data/raw/
+data/staging/
+data/processed/
+*.csv
+*.parquet
+*.avro
+*.orc
+!tests/fixtures/*.csv
+!tests/fixtures/*.parquet

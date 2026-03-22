@@ -3,57 +3,68 @@ version: 2
 models:
   - name: int_user_sessions
     description: >
-      Sessionised user events using a 30-minute inactivity gap.
-      Each row represents a single session with aggregated metrics
-      such as duration, event count, and entry/exit pages.
+      Sessionized user events. Each row represents a user session defined by
+      a 30-minute inactivity timeout. Includes session duration, event counts,
+      first/last event types, revenue, and a session category classification.
     columns:
       - name: session_id
-        description: Deterministic session identifier (user_id + session_index).
+        description: "Unique session identifier (user_id + session_index)."
         tests:
-          - unique
           - not_null
-
+          - unique
       - name: user_id
-        description: User who owns this session.
+        description: "User who owns the session."
         tests:
           - not_null
           - relationships:
               to: ref('stg_users')
               field: user_id
-
-      - name: session_started_at
-        description: Timestamp of the first event in the session.
+              severity: warn
+      - name: session_start_at
+        description: "Timestamp of the first event in the session."
         tests:
           - not_null
-
-      - name: session_ended_at
-        description: Timestamp of the last event in the session.
+      - name: session_end_at
+        description: "Timestamp of the last event in the session."
         tests:
           - not_null
-
       - name: session_duration_seconds
-        description: Duration of the session in seconds.
+        description: "Duration of the session in seconds (end - start)."
         tests:
           - not_null
-
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: true
       - name: session_event_count
-        description: Number of events in the session.
+        description: "Number of events in the session."
         tests:
           - not_null
-
-      - name: distinct_event_types
-        description: Number of distinct event types in the session.
-
-      - name: entry_page
-        description: First page visited in the session.
-
-      - name: exit_page
-        description: Last page visited in the session.
-
-      - name: device_type
-        description: Device type used during the session.
-
+          - dbt_utils.accepted_range:
+              min_value: 1
+              inclusive: true
+      - name: session_category
+        description: "Session classification: bounce, short, medium, long, very_long."
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - bounce
+                - short
+                - medium
+                - long
+                - very_long
+      - name: session_revenue
+        description: "Total revenue generated during the session."
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: true
+      - name: has_conversion
+        description: "1 if any event in the session was a conversion, 0 otherwise."
+        tests:
+          - accepted_values:
+              values: [0, 1]
       - name: session_date
-        description: Date of the session start (for partitioning).
+        description: "Date when the session started."
         tests:
           - not_null

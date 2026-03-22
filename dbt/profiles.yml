@@ -1,30 +1,54 @@
+# dbt profiles configuration
+# Uses environment variables for credentials -- never commit secrets.
+#
+# Override the target at runtime:
+#   dbt run --target prod
+#   dbt run --target dev
+
 data_engineering_pipelines:
   target: dev
+
   outputs:
-
+    # ---- Development (PostgreSQL) ----
     dev:
-      type: databricks
-      catalog: dev_catalog
-      schema: analytics_dev
-      host: "{{ env_var('DATABRICKS_HOST', 'localhost') }}"
-      http_path: "{{ env_var('DATABRICKS_HTTP_PATH', '/sql/1.0/warehouses/dev') }}"
-      token: "{{ env_var('DATABRICKS_TOKEN', 'dapi_dev_token') }}"
+      type: postgres
+      host: "{{ env_var('DBT_PG_HOST', 'localhost') }}"
+      port: "{{ env_var('DBT_PG_PORT', '5432') | int }}"
+      user: "{{ env_var('DBT_PG_USER', 'dbt_user') }}"
+      password: "{{ env_var('DBT_PG_PASSWORD', 'dbt_password') }}"
+      dbname: "{{ env_var('DBT_PG_DBNAME', 'analytics') }}"
+      schema: "{{ env_var('DBT_PG_SCHEMA', 'dbt_dev') }}"
       threads: 4
+      keepalives_idle: 0
+      connect_timeout: 30
+      search_path: public
+      sslmode: prefer
 
-    staging:
-      type: databricks
-      catalog: staging_catalog
-      schema: analytics_staging
-      host: "{{ env_var('DATABRICKS_HOST') }}"
-      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
-      token: "{{ env_var('DATABRICKS_TOKEN') }}"
-      threads: 8
-
+    # ---- Production (Snowflake) ----
     prod:
-      type: databricks
-      catalog: prod_catalog
-      schema: analytics
-      host: "{{ env_var('DATABRICKS_HOST') }}"
-      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
-      token: "{{ env_var('DATABRICKS_TOKEN') }}"
-      threads: 16
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'TRANSFORMER') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'TRANSFORMING_WH') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'ANALYTICS') }}"
+      schema: "{{ env_var('SNOWFLAKE_SCHEMA', 'DBT_PROD') }}"
+      threads: 8
+      client_session_keep_alive: true
+      query_tag: "dbt_prod"
+      retry_on_database_errors: true
+      retry_all: true
+
+    # ---- BigQuery Alternative ----
+    bigquery:
+      type: bigquery
+      method: service-account
+      project: "{{ env_var('GCP_PROJECT_ID', 'my-project') }}"
+      dataset: "{{ env_var('BQ_DATASET', 'dbt_prod') }}"
+      threads: 8
+      timeout_seconds: 300
+      location: US
+      priority: interactive
+      retries: 3
+      keyfile: "{{ env_var('GOOGLE_APPLICATION_CREDENTIALS', '/secrets/bq-keyfile.json') }}"

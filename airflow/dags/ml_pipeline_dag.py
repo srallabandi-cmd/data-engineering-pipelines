@@ -1,106 +1,140 @@
 """
 ML Pipeline DAG
-===============
 
-End-to-end ML pipeline DAG that orchestrates:
+Orchestrates the machine learning workflow:
+1. Feature computation from warehouse data
+2. Model training with hyperparameter tuning
+3. Model evaluation against baseline metrics
+4. Conditional deployment (only if new model outperforms baseline)
+5. Trigger downstream prediction pipeline
 
-1. Feature engineering (reads from warehouse, builds feature store)
-2. Model training (trains a model, logs metrics)
-3. Model evaluation (compares against champion model)
-4. Deployment decision (BranchPythonOperator)
-5. Model registration (registers the model if promoted)
-6. Notification (success or skip)
-
-Schedule: Weekly on Sundays at 10:00 UTC
+Schedule: Weekly on Sundays at 02:00 UTC
 """
 
-import json
-import logging
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.slack.operators.slack_webhook import SlackWebhookOperator
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SLACK_CONN_ID = Variable.get("slack_conn_id", default_var="slack_default")
-WAREHOUSE_BASE = Variable.get("warehouse_base", default_var="s3a://data-warehouse")
-MODEL_REGISTRY_PATH = Variable.get(
-    "model_registry_path", default_var="s3a://ml-models/registry"
+DAG_ID = "ml_pipeline"
+SLACK_WEBHOOK_CONN_ID = "slack_webhook"
+WAREHOUSE_PATH = Variable.get("warehouse_path", default_var="s3a://data-lake/warehouse")
+FEATURE_STORE_PATH = Variable.get("feature_store_path", default_var="s3a://data-lake/features")
+MODEL_REGISTRY_PATH = Variable.get("model_registry_path", default_var="s3a://data-lake/models")
+METRIC_IMPROVEMENT_THRESHOLD = float(
+    Variable.get("ml_metric_improvement_threshold", default_var="0.01")
 )
-FEATURE_STORE_PATH = Variable.get(
-    "feature_store_path", default_var="s3a://ml-models/features"
-)
-PROMOTION_THRESHOLD = float(Variable.get("model_promotion_threshold", default_var="0.02"))
 
 
 # ---------------------------------------------------------------------------
-# Task callables
+# Task Callables
 # ---------------------------------------------------------------------------
 
-
-def build_features(**context) -> Dict[str, Any]:
-    """Read from the warehouse and build training features.
-
-    Produces a feature matrix stored in the feature store path.
+def compute_features(**context) -> Dict[str, Any]:
     """
-    from pyspark.sql import SparkSession
+    Compute ML features from warehouse data.
+
+    Generates feature vectors for user behavior prediction:
+    - User engagement metrics (session counts, event counts, avg duration)
+    - Recency features (days since last activity)
+    - Revenue features (total spend, avg order value)
+    - Temporal features (day of week, hour of day distributions)
+    """
+    import json
+    import sys
+    sys.path.insert(0, "/opt/spark-jobs/utils")
+
+    from spark_session import SparkSessionBuilder
     from pyspark.sql import functions as F
+    from pyspark.sql import Window
 
     execution_date = context["ds"]
-    spark = SparkSession.builder.appName("ml_feature_engineering").getOrCreate()
+    training_window_days = 90
+
+    spark = SparkSessionBuilder(app_name="ML_FeatureComputation").with_delta().with_s3().build()
 
     try:
-        events = spark.read.format("delta").load(f"{WAREHOUSE_BASE}/events")
-        users = spark.read.format("delta").load(f"{WAREHOUSE_BASE}/users")
+        events_df = spark.read.format("delta").load(f"{WAREHOUSE_PATH}/events")
 
-        # User-level feature aggregation
+        # Filter to training window
+        events = events_df.filter(
+            (F.col("ingestion_date") >= F.date_sub(F.lit(execution_date), training_window_days)) &
+            (F.col("ingestion_date") <= execution_date)
+        )
+
+        # User-level features
         user_features = (
-            events.groupBy("user_id")
+            events
+            .groupBy("user_id")
             .agg(
-                F.count("*").alias("total_events"),
-                F.countDistinct("event_type").alias("distinct_event_types"),
+                F.count("event_id").alias("total_events"),
                 F.countDistinct("computed_session_id").alias("total_sessions"),
-                F.avg("session_duration_seconds").alias("avg_session_duration"),
-                F.max("event_ts").alias("last_event_at"),
-                F.min("event_ts").alias("first_event_at"),
-                F.countDistinct("event_date").alias("active_days"),
-                F.countDistinct("device_category").alias("device_count"),
+                F.sum(F.when(F.col("event_type") == "purchase", 1).otherwise(0)).alias("purchase_count"),
+                F.sum(F.when(F.col("event_type") == "page_view", 1).otherwise(0)).alias("pageview_count"),
+                F.sum("revenue").alias("total_revenue"),
+                F.avg("revenue").alias("avg_revenue"),
+                F.max("revenue").alias("max_revenue"),
+                F.avg("duration_ms").alias("avg_duration_ms"),
+                F.max("event_timestamp").alias("last_activity"),
+                F.min("event_timestamp").alias("first_activity"),
+                F.countDistinct("device_type").alias("device_count"),
+                F.countDistinct("country").alias("country_count"),
+                F.countDistinct(F.to_date("event_timestamp")).alias("active_days"),
             )
+            .withColumn(
+                "days_since_last_activity",
+                F.datediff(F.lit(execution_date), F.col("last_activity")),
+            )
+            .withColumn(
+                "account_age_days",
+                F.datediff(F.col("last_activity"), F.col("first_activity")),
+            )
+            .withColumn(
+                "events_per_session",
+                F.when(F.col("total_sessions") > 0, F.col("total_events") / F.col("total_sessions")).otherwise(0),
+            )
+            .withColumn(
+                "conversion_rate",
+                F.when(F.col("total_events") > 0, F.col("purchase_count") / F.col("total_events")).otherwise(0),
+            )
+            .withColumn(
+                "activity_frequency",
+                F.when(F.col("account_age_days") > 0, F.col("active_days") / F.col("account_age_days")).otherwise(0),
+            )
+            # Label: churned if no activity in last 14 days
+            .withColumn(
+                "is_churned",
+                F.when(F.col("days_since_last_activity") > 14, 1).otherwise(0),
+            )
+            .drop("last_activity", "first_activity")
         )
 
-        # Days since first/last event
-        user_features = user_features.withColumn(
-            "tenure_days",
-            F.datediff(F.col("last_event_at"), F.col("first_event_at")),
-        ).withColumn(
-            "recency_days",
-            F.datediff(F.current_date(), F.col("last_event_at")),
-        )
+        # Write features
+        output_path = f"{FEATURE_STORE_PATH}/user_features/execution_date={execution_date}"
+        feature_count = user_features.count()
 
-        # Join with user attributes
-        features = user_features.join(
-            users.select("user_id", "signup_date", "plan_type", "country"),
-            on="user_id",
-            how="left",
-        )
+        user_features.coalesce(10).write.mode("overwrite").parquet(output_path)
 
-        output_path = f"{FEATURE_STORE_PATH}/{execution_date}"
-        features.write.mode("overwrite").format("parquet").save(output_path)
+        result = {
+            "feature_count": feature_count,
+            "feature_columns": len(user_features.columns),
+            "output_path": output_path,
+        }
 
-        feature_count = features.count()
-        logger.info("Built %d feature rows, saved to %s", feature_count, output_path)
-
-        result = {"feature_path": output_path, "feature_count": feature_count}
         context["task_instance"].xcom_push(key="feature_result", value=json.dumps(result))
+        context["task_instance"].xcom_push(key="feature_path", value=output_path)
+
         return result
 
     finally:
@@ -108,281 +142,267 @@ def build_features(**context) -> Dict[str, Any]:
 
 
 def train_model(**context) -> Dict[str, Any]:
-    """Train a classification model on the feature set.
-
-    Uses scikit-learn for simplicity; in production this would use
-    MLflow + a distributed framework.
     """
-    import numpy as np
-    from sklearn.ensemble import GradientBoostingClassifier
-    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
-    from sklearn.model_selection import train_test_split
+    Train a churn prediction model using PySpark MLlib.
 
-    import pandas as pd
+    Uses gradient boosted trees with cross-validation.
+    """
+    import json
+    import sys
+    sys.path.insert(0, "/opt/spark-jobs/utils")
 
-    feature_result = json.loads(
-        context["task_instance"].xcom_pull(
-            task_ids="feature_engineering.build_features", key="feature_result"
-        )
+    from spark_session import SparkSessionBuilder
+    from pyspark.sql import functions as F
+    from pyspark.ml.feature import VectorAssembler, StandardScaler
+    from pyspark.ml.classification import GBTClassifier
+    from pyspark.ml.evaluation import BinaryClassificationEvaluator
+    from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+    from pyspark.ml import Pipeline
+
+    execution_date = context["ds"]
+    feature_path = context["task_instance"].xcom_pull(
+        task_ids="feature_engineering.compute_features", key="feature_path",
     )
-    feature_path = feature_result["feature_path"]
 
-    from pyspark.sql import SparkSession
-
-    spark = SparkSession.builder.appName("ml_train").getOrCreate()
+    spark = SparkSessionBuilder(app_name="ML_TrainModel").with_delta().with_s3().build()
 
     try:
-        features_df = spark.read.format("parquet").load(feature_path)
+        features_df = spark.read.parquet(feature_path).na.fill(0)
 
-        # Create a binary label (e.g., churn prediction)
-        from pyspark.sql import functions as F
+        feature_columns = [
+            "total_events", "total_sessions", "purchase_count", "pageview_count",
+            "total_revenue", "avg_revenue", "max_revenue", "avg_duration_ms",
+            "device_count", "country_count", "active_days",
+            "days_since_last_activity", "account_age_days",
+            "events_per_session", "conversion_rate", "activity_frequency",
+        ]
 
-        labeled = features_df.withColumn(
-            "churned",
-            F.when(F.col("recency_days") > 30, 1).otherwise(0),
+        assembler = VectorAssembler(inputCols=feature_columns, outputCol="raw_features")
+        scaler = StandardScaler(inputCol="raw_features", outputCol="features", withStd=True, withMean=True)
+        gbt = GBTClassifier(labelCol="is_churned", featuresCol="features", maxIter=100)
+
+        pipeline = Pipeline(stages=[assembler, scaler, gbt])
+
+        param_grid = (
+            ParamGridBuilder()
+            .addGrid(gbt.maxDepth, [5, 8, 12])
+            .addGrid(gbt.stepSize, [0.05, 0.1])
+            .addGrid(gbt.subsamplingRate, [0.7, 0.9])
+            .build()
         )
 
-        pdf = labeled.select(
-            "total_events",
-            "distinct_event_types",
-            "total_sessions",
-            "avg_session_duration",
-            "active_days",
-            "tenure_days",
-            "recency_days",
-            "device_count",
-            "churned",
-        ).toPandas()
+        evaluator = BinaryClassificationEvaluator(
+            labelCol="is_churned", metricName="areaUnderROC",
+        )
+
+        cv = CrossValidator(
+            estimator=pipeline,
+            estimatorParamMaps=param_grid,
+            evaluator=evaluator,
+            numFolds=3,
+            parallelism=4,
+        )
+
+        train_df, test_df = features_df.randomSplit([0.8, 0.2], seed=42)
+
+        cv_model = cv.fit(train_df)
+
+        # Evaluate on test set
+        predictions = cv_model.transform(test_df)
+        auc_roc = evaluator.evaluate(predictions)
+
+        precision_evaluator = BinaryClassificationEvaluator(
+            labelCol="is_churned", metricName="areaUnderPR",
+        )
+        auc_pr = precision_evaluator.evaluate(predictions)
+
+        # Save model
+        model_path = f"{MODEL_REGISTRY_PATH}/churn_model/execution_date={execution_date}"
+        cv_model.bestModel.write().overwrite().save(model_path)
+
+        result = {
+            "auc_roc": round(auc_roc, 4),
+            "auc_pr": round(auc_pr, 4),
+            "model_path": model_path,
+            "train_count": train_df.count(),
+            "test_count": test_df.count(),
+            "best_params": str(cv_model.bestModel.stages[-1].extractParamMap()),
+        }
+
+        context["task_instance"].xcom_push(key="training_result", value=json.dumps(result))
+        context["task_instance"].xcom_push(key="model_path", value=model_path)
+        context["task_instance"].xcom_push(key="auc_roc", value=auc_roc)
+
+        return result
 
     finally:
         spark.stop()
 
-    # Handle missing values
-    pdf = pdf.fillna(0)
-
-    X = pdf.drop("churned", axis=1)
-    y = pdf["churned"]
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-
-    model = GradientBoostingClassifier(
-        n_estimators=200,
-        max_depth=5,
-        learning_rate=0.1,
-        random_state=42,
-    )
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    metrics = {
-        "accuracy": round(accuracy_score(y_test, y_pred), 4),
-        "precision": round(precision_score(y_test, y_pred, zero_division=0), 4),
-        "recall": round(recall_score(y_test, y_pred, zero_division=0), 4),
-        "f1": round(f1_score(y_test, y_pred, zero_division=0), 4),
-        "train_size": len(X_train),
-        "test_size": len(X_test),
-    }
-
-    logger.info("Model metrics: %s", json.dumps(metrics))
-    context["task_instance"].xcom_push(key="model_metrics", value=json.dumps(metrics))
-    return metrics
-
 
 def evaluate_model(**context) -> Dict[str, Any]:
-    """Compare candidate model metrics against the current champion."""
-    candidate_metrics = json.loads(
-        context["task_instance"].xcom_pull(
-            task_ids="training.train_model", key="model_metrics"
-        )
-    )
+    """
+    Compare the new model against the baseline (previous production model).
 
-    # Load champion metrics (from a previous run or model registry)
-    champion_metrics = {"f1": 0.0}  # default when no champion exists
-    try:
-        champion_raw = Variable.get("champion_model_metrics")
-        if champion_raw:
-            champion_metrics = json.loads(champion_raw)
-    except Exception:
-        logger.info("No champion model found — candidate will be promoted")
+    Loads the baseline metrics and compares AUC-ROC.
+    """
+    import json
 
-    candidate_f1 = candidate_metrics.get("f1", 0.0)
-    champion_f1 = champion_metrics.get("f1", 0.0)
-    improvement = candidate_f1 - champion_f1
+    ti = context["task_instance"]
+    new_auc = float(ti.xcom_pull(task_ids="model_training.train_model", key="auc_roc"))
 
-    evaluation = {
-        "candidate_f1": candidate_f1,
-        "champion_f1": champion_f1,
+    # Load baseline metrics (from Airflow Variable or previous run)
+    baseline_auc = float(Variable.get("ml_baseline_auc_roc", default_var="0.5"))
+
+    improvement = new_auc - baseline_auc
+    meets_threshold = improvement >= METRIC_IMPROVEMENT_THRESHOLD
+
+    result = {
+        "new_auc_roc": round(new_auc, 4),
+        "baseline_auc_roc": round(baseline_auc, 4),
         "improvement": round(improvement, 4),
-        "promote": improvement >= PROMOTION_THRESHOLD,
+        "threshold": METRIC_IMPROVEMENT_THRESHOLD,
+        "should_deploy": meets_threshold,
     }
 
-    logger.info("Evaluation: %s", json.dumps(evaluation))
-    context["task_instance"].xcom_push(key="evaluation", value=json.dumps(evaluation))
-    return evaluation
+    ti.xcom_push(key="evaluation_result", value=json.dumps(result))
+    ti.xcom_push(key="should_deploy", value=meets_threshold)
+
+    return result
 
 
 def decide_deployment(**context) -> str:
-    """Branch: promote the model or skip deployment."""
-    evaluation = json.loads(
-        context["task_instance"].xcom_pull(
-            task_ids="evaluation.evaluate_model", key="evaluation"
-        )
+    """
+    Branch: deploy model if it outperforms baseline, otherwise skip.
+    """
+    ti = context["task_instance"]
+    should_deploy = ti.xcom_pull(
+        task_ids="model_evaluation.evaluate_model", key="should_deploy",
     )
 
-    if evaluation.get("promote", False):
-        logger.info("Model promoted — F1 improvement of %.4f", evaluation["improvement"])
-        return "deployment.register_model"
-    else:
-        logger.info("Model not promoted — improvement %.4f below threshold", evaluation["improvement"])
-        return "notify_skip"
+    if should_deploy:
+        return "deployment.deploy_model"
+    return "deployment.skip_deployment"
 
 
-def register_model(**context) -> Dict[str, Any]:
-    """Register the candidate model in the model registry."""
-    execution_date = context["ds"]
-    metrics = json.loads(
-        context["task_instance"].xcom_pull(
-            task_ids="training.train_model", key="model_metrics"
-        )
-    )
+def deploy_model(**context) -> Dict[str, Any]:
+    """
+    Deploy the trained model to the serving layer.
 
-    model_version = f"v_{execution_date.replace('-', '')}"
-    registry_entry = {
-        "model_name": "churn_prediction",
-        "version": model_version,
-        "metrics": metrics,
-        "registered_at": datetime.utcnow().isoformat(),
-        "status": "champion",
+    Updates the production model pointer and the baseline metrics.
+    """
+    import json
+
+    ti = context["task_instance"]
+    model_path = ti.xcom_pull(task_ids="model_training.train_model", key="model_path")
+    new_auc = float(ti.xcom_pull(task_ids="model_training.train_model", key="auc_roc"))
+
+    # Update production model pointer
+    Variable.set("ml_production_model_path", model_path)
+    Variable.set("ml_baseline_auc_roc", str(round(new_auc, 4)))
+
+    result = {
+        "model_path": model_path,
+        "new_baseline_auc": round(new_auc, 4),
+        "deployed_at": datetime.utcnow().isoformat(),
     }
 
-    # Persist champion metrics for future comparisons
-    Variable.set("champion_model_metrics", json.dumps(metrics))
-
-    logger.info("Model registered: %s", json.dumps(registry_entry))
-    context["task_instance"].xcom_push(
-        key="registry_entry", value=json.dumps(registry_entry)
-    )
-
-    return registry_entry
-
-
-def notify_deployment(**context) -> None:
-    """Notify about successful model deployment."""
-    registry_raw = context["task_instance"].xcom_pull(
-        task_ids="deployment.register_model", key="registry_entry"
-    )
-    registry = json.loads(registry_raw) if registry_raw else {}
-
-    message = (
-        f":rocket: *New Model Deployed*\n"
-        f"*Model:* `{registry.get('model_name', 'unknown')}`\n"
-        f"*Version:* `{registry.get('version', 'unknown')}`\n"
-        f"*F1 Score:* {registry.get('metrics', {}).get('f1', 'N/A')}"
-    )
-    SlackWebhookOperator(
-        task_id="slack_deploy",
-        slack_webhook_conn_id=SLACK_CONN_ID,
-        message=message,
-    ).execute(context=context)
-
-
-def notify_skip(**context) -> None:
-    """Notify that model deployment was skipped."""
-    execution_date = context["ds"]
-    message = (
-        f":fast_forward: *Model Deployment Skipped*\n"
-        f"*Date:* {execution_date}\n"
-        f"Candidate model did not exceed champion by the promotion threshold ({PROMOTION_THRESHOLD})."
-    )
-    SlackWebhookOperator(
-        task_id="slack_skip",
-        slack_webhook_conn_id=SLACK_CONN_ID,
-        message=message,
-    ).execute(context=context)
+    ti.xcom_push(key="deployment_result", value=json.dumps(result))
+    return result
 
 
 # ---------------------------------------------------------------------------
-# DAG definition
+# DAG Definition
 # ---------------------------------------------------------------------------
 default_args = {
     "owner": "ml-engineering",
     "depends_on_past": False,
+    "email": ["ml-alerts@example.com"],
+    "email_on_failure": True,
     "retries": 1,
     "retry_delay": timedelta(minutes=10),
-    "email": ["ml-engineering@example.com"],
-    "email_on_failure": True,
-    "email_on_retry": False,
-    "execution_timeout": timedelta(hours=4),
+    "execution_timeout": timedelta(hours=6),
 }
 
 with DAG(
-    dag_id="ml_pipeline",
+    dag_id=DAG_ID,
     default_args=default_args,
-    description="Weekly ML pipeline: feature engineering -> training -> evaluation -> deployment",
-    schedule_interval="0 10 * * 0",
+    description="ML pipeline: feature computation, training, evaluation, and conditional deployment.",
+    schedule_interval="0 2 * * 0",  # Weekly on Sundays
     start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
-    tags=["ml", "production", "weekly"],
+    tags=["ml", "weekly", "production"],
     doc_md=__doc__,
 ) as dag:
 
-    # -- Feature Engineering -----------------------------------------------
-    with TaskGroup("feature_engineering") as feature_group:
-        features = PythonOperator(
-            task_id="build_features",
-            python_callable=build_features,
+    # ---- Feature Engineering ----
+    with TaskGroup(group_id="feature_engineering") as feature_group:
+        compute_features_task = PythonOperator(
+            task_id="compute_features",
+            python_callable=compute_features,
             provide_context=True,
         )
 
-    # -- Training ----------------------------------------------------------
-    with TaskGroup("training") as training_group:
-        train = PythonOperator(
+    # ---- Model Training ----
+    with TaskGroup(group_id="model_training") as training_group:
+        train_model_task = PythonOperator(
             task_id="train_model",
             python_callable=train_model,
             provide_context=True,
         )
 
-    # -- Evaluation --------------------------------------------------------
-    with TaskGroup("evaluation") as eval_group:
-        evaluate = PythonOperator(
+    # ---- Model Evaluation ----
+    with TaskGroup(group_id="model_evaluation") as evaluation_group:
+        evaluate_model_task = PythonOperator(
             task_id="evaluate_model",
             python_callable=evaluate_model,
             provide_context=True,
         )
 
-    # -- Deployment decision -----------------------------------------------
-    branch = BranchPythonOperator(
+    # ---- Deployment Decision ----
+    decide = BranchPythonOperator(
         task_id="decide_deployment",
         python_callable=decide_deployment,
         provide_context=True,
     )
 
-    # -- Deployment --------------------------------------------------------
-    with TaskGroup("deployment") as deploy_group:
-        register = PythonOperator(
-            task_id="register_model",
-            python_callable=register_model,
+    # ---- Deployment ----
+    with TaskGroup(group_id="deployment") as deployment_group:
+        deploy = PythonOperator(
+            task_id="deploy_model",
+            python_callable=deploy_model,
             provide_context=True,
         )
 
-    # -- Notifications -----------------------------------------------------
-    notify_deploy = PythonOperator(
-        task_id="notify_deployment",
-        python_callable=notify_deployment,
-        provide_context=True,
-        trigger_rule=TriggerRule.ALL_SUCCESS,
+        skip = EmptyOperator(task_id="skip_deployment")
+
+    # ---- Trigger Downstream ----
+    trigger_prediction = TriggerDagRunOperator(
+        task_id="trigger_prediction_pipeline",
+        trigger_dag_id="batch_prediction_pipeline",
+        execution_date="{{ ds }}",
+        wait_for_completion=False,
+        trigger_rule=TriggerRule.ONE_SUCCESS,
+        conf={
+            "model_path": "{{ task_instance.xcom_pull(task_ids='model_training.train_model', key='model_path') }}",
+            "execution_date": "{{ ds }}",
+        },
     )
 
-    skip_notify = PythonOperator(
-        task_id="notify_skip",
-        python_callable=notify_skip,
-        provide_context=True,
+    # ---- Notifications ----
+    notify_completion = SlackWebhookOperator(
+        task_id="notify_completion",
+        slack_webhook_conn_id=SLACK_WEBHOOK_CONN_ID,
+        message=(
+            ":brain: *ML Pipeline Completed*\n"
+            "*Date:* `{{ ds }}`\n"
+            "*New AUC-ROC:* `{{ task_instance.xcom_pull(task_ids='model_training.train_model', key='auc_roc') }}`\n"
+            "*Deployed:* `{{ task_instance.xcom_pull(task_ids='model_evaluation.evaluate_model', key='should_deploy') }}`\n"
+        ),
+        trigger_rule=TriggerRule.ALL_DONE,
     )
 
-    # -- Dependencies ------------------------------------------------------
-    feature_group >> training_group >> eval_group >> branch
-    branch >> deploy_group >> notify_deploy
-    branch >> skip_notify
+    # ---- Dependencies ----
+    feature_group >> training_group >> evaluation_group >> decide
+    decide >> [deploy, skip]
+    [deploy, skip] >> trigger_prediction >> notify_completion

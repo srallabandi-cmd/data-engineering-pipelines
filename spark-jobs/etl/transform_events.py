@@ -1,35 +1,33 @@
 """
-Event Transformation Module
-============================
+Transform raw events from the staging layer into enriched, analytics-ready datasets.
 
-Production PySpark transformations for user event data including:
-- Window functions (lag, lead, row_number, dense_rank)
-- Session identification (30-minute inactivity gap)
-- Multi-column aggregations
-- Pivoting
-- Broadcast join optimisation
-- UDF registration and usage
-- Data quality assertions
-- Partitioned, repartitioned output
+This module applies complex PySpark transformations including window functions,
+session identification, pivot operations, UDFs, data enrichment joins,
+and partition optimization before writing to the processed layer.
 
 Usage:
-    spark-submit --packages io.delta:delta-core_2.12:2.4.0 \
-        spark-jobs/etl/transform_events.py \
-        --input-path s3a://data-lake/raw/events \
-        --output-path s3a://data-lake/transformed/events \
-        --batch-date 2024-01-15
+    spark-submit --master spark://master:7077 spark-jobs/etl/transform_events.py \
+        --input-path s3a://data-lake/staging/events \
+        --output-path s3a://data-lake/processed/events \
+        --dimensions-path s3a://data-lake/dimensions \
+        --date 2024-01-15
 """
 
 import argparse
 import hashlib
+import json
 import logging
 import sys
-from datetime import datetime, timezone
-from typing import List, Optional
+import time
+from datetime import datetime
+from typing import Dict, List, Optional
 
-from pyspark.sql import DataFrame, SparkSession, Window
+from pyspark.sql import SparkSession, DataFrame, Window
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType
+from pyspark.sql.types import (
+    StructType, StructField, StringType, LongType,
+    DoubleType, TimestampType, IntegerType, MapType,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -37,360 +35,404 @@ from pyspark.sql.types import StringType
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger("transform_events")
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-SESSION_TIMEOUT_SECONDS = 30 * 60  # 30 minutes
-OUTPUT_PARTITIONS = 8
 
 # ---------------------------------------------------------------------------
-# UDFs
+# UDF Definitions
 # ---------------------------------------------------------------------------
-
-
-def _anonymise_ip(ip: Optional[str]) -> Optional[str]:
-    """Hash an IP address for privacy compliance."""
-    if ip is None:
-        return None
-    return hashlib.sha256(ip.encode("utf-8")).hexdigest()[:16]
-
-
-def _classify_device(user_agent: Optional[str]) -> str:
-    """Classify device type from user-agent string."""
-    if user_agent is None:
+@F.udf(StringType())
+def classify_device(device_type: str, os: str) -> str:
+    """Classify device into a normalized category."""
+    if device_type is None:
         return "unknown"
-    ua_lower = user_agent.lower()
-    if any(kw in ua_lower for kw in ("iphone", "android", "mobile")):
+    device_lower = device_type.lower()
+    if device_lower in ("mobile", "phone", "smartphone"):
         return "mobile"
-    if any(kw in ua_lower for kw in ("ipad", "tablet")):
+    elif device_lower in ("tablet", "ipad"):
         return "tablet"
-    if any(kw in ua_lower for kw in ("bot", "crawler", "spider")):
+    elif device_lower in ("desktop", "laptop", "pc"):
+        return "desktop"
+    elif device_lower in ("tv", "smart_tv", "console"):
+        return "smart_tv"
+    elif device_lower == "bot" or (os and os.lower() == "bot"):
         return "bot"
-    return "desktop"
+    return "other"
+
+
+@F.udf(StringType())
+def extract_utm_source(page_url: str) -> str:
+    """Extract UTM source parameter from a URL."""
+    if page_url is None:
+        return None
+    try:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(page_url)
+        params = parse_qs(parsed.query)
+        sources = params.get("utm_source", [None])
+        return sources[0]
+    except Exception:
+        return None
+
+
+@F.udf(StringType())
+def hash_pii(value: str) -> str:
+    """One-way hash for PII fields."""
+    if value is None:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
-# Transformation steps
+# Transformation Functions
 # ---------------------------------------------------------------------------
+SESSION_TIMEOUT_SECONDS = 1800  # 30 minutes
 
 
-def read_source(spark: SparkSession, input_path: str, input_format: str) -> DataFrame:
-    """Read raw events from Delta or Parquet source."""
-    logger.info("Reading source data from %s (%s)", input_path, input_format)
-    if input_format == "delta":
-        df = spark.read.format("delta").load(input_path)
-    else:
-        df = spark.read.format("parquet").load(input_path)
-
-    record_count = df.count()
-    logger.info("Source contains %d records", record_count)
-    return df
-
-
-def deduplicate(df: DataFrame) -> DataFrame:
-    """Remove exact duplicate events, keeping the earliest ingestion."""
-    window = Window.partitionBy("event_id").orderBy(F.col("_extracted_at").asc())
-    deduped = (
-        df.withColumn("_row_num", F.row_number().over(window))
-        .filter(F.col("_row_num") == 1)
-        .drop("_row_num")
-    )
-    removed = df.count() - deduped.count()
-    if removed > 0:
-        logger.info("Removed %d duplicate records", removed)
-    return deduped
-
-
-def enrich_with_udfs(spark: SparkSession, df: DataFrame) -> DataFrame:
-    """Apply UDFs for IP anonymisation and device classification."""
-    anonymise_ip_udf = F.udf(_anonymise_ip, StringType())
-    classify_device_udf = F.udf(_classify_device, StringType())
-
-    return df.withColumn("ip_hash", anonymise_ip_udf(F.col("ip_address"))).withColumn(
-        "device_category", classify_device_udf(F.col("user_agent"))
-    )
-
-
-def add_window_functions(df: DataFrame) -> DataFrame:
-    """Add analytical columns using window functions.
-
-    Columns added:
-    - prev_event_type / next_event_type (lag / lead)
-    - event_rank_per_user (dense_rank by timestamp)
-    - seconds_since_last_event (time delta to prior event)
+def add_session_boundaries(df: DataFrame) -> DataFrame:
     """
-    user_window = Window.partitionBy("user_id").orderBy("event_ts")
+    Identify user sessions based on a 30-minute inactivity timeout.
+
+    Uses window functions (lag) to compute time gaps between consecutive
+    events per user, then assigns a session identifier.
+    """
+    user_window = Window.partitionBy("user_id").orderBy("event_timestamp")
+
+    df_with_lag = df.withColumn(
+        "prev_event_ts", F.lag("event_timestamp").over(user_window)
+    ).withColumn(
+        "time_gap_seconds",
+        F.when(
+            F.col("prev_event_ts").isNotNull(),
+            F.unix_timestamp("event_timestamp") - F.unix_timestamp("prev_event_ts"),
+        ).otherwise(F.lit(SESSION_TIMEOUT_SECONDS + 1)),
+    )
+
+    df_with_boundary = df_with_lag.withColumn(
+        "is_new_session",
+        F.when(F.col("time_gap_seconds") > SESSION_TIMEOUT_SECONDS, F.lit(1)).otherwise(F.lit(0)),
+    )
+
+    df_with_session_idx = df_with_boundary.withColumn(
+        "session_idx",
+        F.sum("is_new_session").over(
+            user_window.rowsBetween(Window.unboundedPreceding, Window.currentRow)
+        ),
+    )
+
+    df_with_session = df_with_session_idx.withColumn(
+        "computed_session_id",
+        F.concat_ws("_", F.col("user_id"), F.col("session_idx").cast(StringType())),
+    )
+
+    return df_with_session.drop("prev_event_ts", "time_gap_seconds", "is_new_session", "session_idx")
+
+
+def add_event_sequence_features(df: DataFrame) -> DataFrame:
+    """
+    Add sequencing features with window functions.
+
+    - row_number, dense_rank within each session
+    - lead/lag of event_type (previous_event, next_event)
+    - time to next event
+    - running event count
+    """
+    session_window = Window.partitionBy("user_id", "computed_session_id").orderBy("event_timestamp")
 
     return (
-        df.withColumn("prev_event_type", F.lag("event_type", 1).over(user_window))
-        .withColumn("next_event_type", F.lead("event_type", 1).over(user_window))
-        .withColumn("event_rank_per_user", F.dense_rank().over(user_window))
-        .withColumn("prev_event_ts", F.lag("event_ts", 1).over(user_window))
+        df
+        .withColumn("event_sequence_number", F.row_number().over(session_window))
+        .withColumn("event_rank", F.dense_rank().over(session_window))
+        .withColumn("previous_event_type", F.lag("event_type", 1).over(session_window))
+        .withColumn("next_event_type", F.lead("event_type", 1).over(session_window))
+        .withColumn("next_event_ts", F.lead("event_timestamp", 1).over(session_window))
         .withColumn(
-            "seconds_since_last_event",
+            "seconds_to_next_event",
             F.when(
-                F.col("prev_event_ts").isNotNull(),
-                F.unix_timestamp("event_ts") - F.unix_timestamp("prev_event_ts"),
-            ).otherwise(F.lit(None)),
+                F.col("next_event_ts").isNotNull(),
+                F.unix_timestamp("next_event_ts") - F.unix_timestamp("event_timestamp"),
+            ),
         )
-    )
-
-
-def sessionize(df: DataFrame) -> DataFrame:
-    """Assign a session_id based on a 30-minute inactivity gap.
-
-    A new session starts whenever the gap between consecutive events for the
-    same user exceeds ``SESSION_TIMEOUT_SECONDS``.
-    """
-    user_window = Window.partitionBy("user_id").orderBy("event_ts")
-    cumulative_window = (
-        Window.partitionBy("user_id")
-        .orderBy("event_ts")
-        .rowsBetween(Window.unboundedPreceding, Window.currentRow)
-    )
-
-    return (
-        df.withColumn(
-            "is_new_session",
-            F.when(
-                F.col("seconds_since_last_event").isNull()
-                | (F.col("seconds_since_last_event") > SESSION_TIMEOUT_SECONDS),
-                F.lit(1),
-            ).otherwise(F.lit(0)),
-        )
-        .withColumn("session_seq", F.sum("is_new_session").over(cumulative_window))
         .withColumn(
-            "computed_session_id",
-            F.concat_ws("_", F.col("user_id"), F.col("session_seq").cast("string")),
+            "cumulative_duration_ms",
+            F.sum("duration_ms").over(
+                session_window.rowsBetween(Window.unboundedPreceding, Window.currentRow)
+            ),
         )
-        .drop("is_new_session", "session_seq")
+        .drop("next_event_ts")
     )
 
 
 def compute_session_aggregates(df: DataFrame) -> DataFrame:
-    """Calculate per-session aggregates joined back to event level."""
-    session_stats = df.groupBy("user_id", "computed_session_id").agg(
-        F.count("*").alias("session_event_count"),
-        F.min("event_ts").alias("session_start"),
-        F.max("event_ts").alias("session_end"),
-        F.countDistinct("event_type").alias("session_distinct_event_types"),
-        F.first("event_type").alias("session_entry_event"),
-        F.last("event_type").alias("session_exit_event"),
-    )
-    session_stats = session_stats.withColumn(
-        "session_duration_seconds",
-        F.unix_timestamp("session_end") - F.unix_timestamp("session_start"),
-    )
+    """
+    Compute per-session aggregate metrics.
 
-    return df.join(
-        F.broadcast(session_stats),
-        on=["user_id", "computed_session_id"],
-        how="left",
+    Groups by user_id and computed_session_id with multiple agg functions,
+    then joins back to the event-level data.
+    """
+    session_aggs = (
+        df
+        .groupBy("user_id", "computed_session_id")
+        .agg(
+            F.count("event_id").alias("session_event_count"),
+            F.min("event_timestamp").alias("session_start"),
+            F.max("event_timestamp").alias("session_end"),
+            F.sum("duration_ms").alias("session_total_duration_ms"),
+            F.sum("revenue").alias("session_total_revenue"),
+            F.countDistinct("event_type").alias("session_distinct_events"),
+            F.max("is_conversion").alias("session_has_conversion"),
+            F.first("device_type").alias("session_device"),
+            F.first("country").alias("session_country"),
+        )
+        .withColumn(
+            "session_duration_seconds",
+            F.unix_timestamp("session_end") - F.unix_timestamp("session_start"),
+        )
     )
+    return session_aggs
 
 
-def pivot_event_counts(df: DataFrame) -> DataFrame:
-    """Create a pivoted summary of event counts per user per date."""
+def compute_event_type_pivot(df: DataFrame) -> DataFrame:
+    """
+    Pivot event counts by event_type per user per day.
+
+    Produces a wide table with one column per event type.
+    """
     return (
-        df.groupBy("user_id", "event_date")
-        .pivot("event_type")
-        .agg(F.count("*"))
+        df
+        .withColumn("event_date", F.to_date("event_timestamp"))
+        .groupBy("user_id", "event_date")
+        .pivot(
+            "event_type",
+            values=["page_view", "click", "scroll", "purchase", "signup", "login", "logout"],
+        )
+        .agg(F.count("event_id"))
         .na.fill(0)
     )
 
 
-def assert_quality(df: DataFrame, label: str) -> None:
-    """Run basic data quality assertions and log violations."""
-    total = df.count()
-    if total == 0:
-        raise ValueError(f"Quality check failed for '{label}': DataFrame is empty")
+def apply_device_classification(df: DataFrame) -> DataFrame:
+    """Apply the device classification UDF and UTM extraction."""
+    return (
+        df
+        .withColumn("device_category", classify_device(F.col("device_type"), F.col("os")))
+        .withColumn("utm_source", extract_utm_source(F.col("page_url")))
+    )
 
-    null_event_ids = df.filter(F.col("event_id").isNull()).count()
-    null_user_ids = df.filter(F.col("user_id").isNull()).count()
-    null_timestamps = df.filter(F.col("event_ts").isNull()).count()
 
-    violations = {
-        "null_event_id": null_event_ids,
-        "null_user_id": null_user_ids,
-        "null_event_ts": null_timestamps,
-    }
-    failed = {k: v for k, v in violations.items() if v > 0}
-    if failed:
-        pct = {k: round(v / total * 100, 2) for k, v in failed.items()}
-        logger.warning("Quality violations in '%s': %s (pct of total: %s)", label, failed, pct)
-        # Fail hard if more than 5 % of records have null PKs
-        for key in ("null_event_id", "null_user_id"):
-            if violations[key] / total > 0.05:
-                raise ValueError(
-                    f"Quality gate FAILED: {key} rate {violations[key]/total:.2%} exceeds 5% threshold"
-                )
+def enrich_with_dimensions(
+    df: DataFrame,
+    dim_users: DataFrame,
+    dim_geo: Optional[DataFrame] = None,
+) -> DataFrame:
+    """
+    Join event data with dimension tables for enrichment.
+
+    Performs left joins to preserve all events even if dimension data is missing.
+    Uses broadcast hints for small dimensions.
+    """
+    enriched = df.join(
+        F.broadcast(dim_users.select(
+            F.col("user_id"),
+            F.col("user_segment"),
+            F.col("signup_date").alias("user_signup_date"),
+            F.col("lifetime_value").alias("user_ltv"),
+            F.col("is_active").alias("user_is_active"),
+        )),
+        on="user_id",
+        how="left",
+    )
+
+    if dim_geo is not None:
+        enriched = enriched.join(
+            F.broadcast(dim_geo.select(
+                F.col("country"),
+                F.col("region"),
+                F.col("continent"),
+                F.col("timezone"),
+            )),
+            on="country",
+            how="left",
+        )
+
+    enriched = enriched.withColumn(
+        "days_since_signup",
+        F.when(
+            F.col("user_signup_date").isNotNull(),
+            F.datediff(F.col("event_timestamp"), F.col("user_signup_date")),
+        ),
+    )
+
+    return enriched
+
+
+def optimize_and_write(
+    df: DataFrame,
+    output_path: str,
+    partition_cols: List[str],
+    target_partitions: int = 200,
+    file_format: str = "parquet",
+) -> int:
+    """
+    Repartition and write the transformed DataFrame.
+
+    Uses coalesce when reducing partitions for efficiency and repartition
+    when a shuffle is required for balanced partition sizes.
+    """
+    record_count = df.count()
+    logger.info("Preparing to write %d records.", record_count)
+
+    if record_count == 0:
+        logger.warning("No records to write.")
+        return 0
+
+    # Determine optimal number of output files
+    # Aim for ~128 MB per file assuming average row size of 1 KB
+    estimated_size_mb = (record_count * 1024) / (1024 * 1024)
+    optimal_files = max(1, int(estimated_size_mb / 128))
+    optimal_files = min(optimal_files, target_partitions)
+
+    logger.info(
+        "Repartitioning to %d files (estimated size: %.0f MB).",
+        optimal_files, estimated_size_mb,
+    )
+
+    repartitioned = df.repartition(optimal_files, *[F.col(c) for c in partition_cols])
+
+    writer = repartitioned.write.mode("overwrite").partitionBy(*partition_cols)
+
+    if file_format == "delta":
+        writer.format("delta").option("overwriteSchema", "true").save(output_path)
     else:
-        logger.info("Quality check '%s' passed — %d records OK", label, total)
+        writer.option("compression", "snappy").parquet(output_path)
+
+    logger.info("Write complete: %d records to %s.", record_count, output_path)
+    return record_count
 
 
 # ---------------------------------------------------------------------------
-# Writer
+# Output Schema Validation
 # ---------------------------------------------------------------------------
+EXPECTED_OUTPUT_COLUMNS = {
+    "event_id", "event_type", "user_id", "computed_session_id",
+    "event_timestamp", "device_category", "utm_source",
+    "event_sequence_number", "previous_event_type", "next_event_type",
+    "seconds_to_next_event", "cumulative_duration_ms",
+    "ingestion_date",
+}
 
 
-def write_output(df: DataFrame, output_path: str, output_format: str) -> int:
-    """Write the transformed DataFrame partitioned by event_date."""
-    row_count = df.count()
-    logger.info("Writing %d transformed records to %s", row_count, output_path)
-
-    df_out = df.withColumn("_transformed_at", F.current_timestamp())
-
-    # Repartition for optimal file sizes (~128 MB target)
-    df_out = df_out.repartition(OUTPUT_PARTITIONS, "event_date")
-
-    writer = df_out.write.mode("overwrite").partitionBy("event_date")
-    if output_format == "delta":
-        writer.format("delta").save(output_path)
-    else:
-        writer.format("parquet").option("compression", "snappy").save(output_path)
-
-    logger.info("Write complete — %d records, format=%s", row_count, output_format)
-    return row_count
+def validate_output_schema(df: DataFrame) -> None:
+    """Validate the output DataFrame contains all expected columns."""
+    actual_columns = set(df.columns)
+    missing = EXPECTED_OUTPUT_COLUMNS - actual_columns
+    if missing:
+        raise ValueError(f"Output DataFrame missing columns: {missing}")
+    logger.info("Output schema validation passed (%d columns).", len(actual_columns))
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
-
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Transform raw event data.")
-    parser.add_argument("--input-path", required=True, help="Path to raw events.")
-    parser.add_argument("--output-path", required=True, help="Path for transformed output.")
-    parser.add_argument(
-        "--format",
-        dest="output_format",
-        choices=["delta", "parquet"],
-        default="delta",
-    )
-    parser.add_argument("--batch-date", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-    parser.add_argument("--input-format", choices=["delta", "parquet"], default="delta")
+    parser = argparse.ArgumentParser(description="Transform events from staging to processed.")
+    parser.add_argument("--input-path", required=True, help="Staging events path.")
+    parser.add_argument("--output-path", required=True, help="Processed events output path.")
+    parser.add_argument("--dimensions-path", required=True, help="Dimensions base path.")
+    parser.add_argument("--date", default=None, help="Processing date (YYYY-MM-DD).")
+    parser.add_argument("--format", choices=["parquet", "delta"], default="parquet")
+    parser.add_argument("--target-partitions", type=int, default=200)
     return parser.parse_args(argv)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
+    start_time = time.time()
 
-    logger.info(
-        "Starting event transformation — input=%s output=%s date=%s",
-        args.input_path,
-        args.output_path,
-        args.batch_date,
-    )
+    sys.path.insert(0, "spark-jobs/utils")
+    from spark_session import SparkSessionBuilder
 
-    spark = (
-        SparkSession.builder.appName("transform_events")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config(
-            "spark.sql.catalog.spark_catalog",
-            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-        )
-        .config("spark.sql.shuffle.partitions", "200")
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        .config("spark.sql.autoBroadcastJoinThreshold", str(50 * 1024 * 1024))
-        .getOrCreate()
-    )
-    spark.sparkContext.setLogLevel("WARN")
-
-    # Register UDFs for SQL usage as well
-    spark.udf.register("anonymise_ip", _anonymise_ip, StringType())
-    spark.udf.register("classify_device", _classify_device, StringType())
+    spark = SparkSessionBuilder(app_name="TransformEvents").with_delta().build()
 
     try:
-        # 1. Read
-        raw = read_source(spark, args.input_path, args.input_format)
+        # ---- Read Staging Data ----
+        logger.info("Reading staging data from %s", args.input_path)
+        if args.date:
+            events_df = spark.read.parquet(args.input_path).filter(
+                F.col("ingestion_date") == args.date
+            )
+        else:
+            events_df = spark.read.parquet(args.input_path)
 
-        # 2. Deduplicate
-        deduped = deduplicate(raw)
+        input_count = events_df.count()
+        logger.info("Read %d events from staging.", input_count)
 
-        # 3. Parse timestamp & derive date
-        parsed = (
-            deduped.withColumn("event_ts", F.to_timestamp("event_timestamp"))
-            .withColumn("event_date", F.to_date("event_ts"))
-            .withColumn("event_hour", F.hour("event_ts"))
+        if input_count == 0:
+            logger.warning("No events to process. Exiting.")
+            return
+
+        # ---- Read Dimension Tables ----
+        dim_users_path = f"{args.dimensions_path}/dim_users"
+        logger.info("Reading dimension: %s", dim_users_path)
+        dim_users = spark.read.parquet(dim_users_path)
+
+        # ---- Apply Transformations ----
+        logger.info("Applying device classification and UTM extraction.")
+        df = apply_device_classification(events_df)
+
+        logger.info("Computing session boundaries.")
+        df = add_session_boundaries(df)
+
+        logger.info("Adding event sequence features.")
+        df = add_event_sequence_features(df)
+
+        logger.info("Enriching with dimension tables.")
+        df = enrich_with_dimensions(df, dim_users)
+
+        # ---- Validate ----
+        validate_output_schema(df)
+
+        # ---- Write Processed Data ----
+        partition_cols = ["ingestion_date", "event_type"]
+        records_written = optimize_and_write(
+            df, args.output_path, partition_cols,
+            target_partitions=args.target_partitions,
+            file_format=args.format,
         )
 
-        # 4. Enrich with UDFs
-        enriched = enrich_with_udfs(spark, parsed)
-
-        # Cache — we reuse this DataFrame multiple times
-        enriched.cache()
-        logger.info("Cached enriched DataFrame (%d records)", enriched.count())
-
-        # 5. Window functions
-        windowed = add_window_functions(enriched)
-
-        # 6. Sessionize
-        sessionized = sessionize(windowed)
-
-        # 7. Session aggregates (broadcast join)
-        with_session_stats = compute_session_aggregates(sessionized)
-
-        # 8. Quality assertions
-        assert_quality(with_session_stats, "post_transform")
-
-        # 9. Write main output
-        final_columns = [
-            "event_id",
-            "user_id",
-            "event_type",
-            "event_ts",
-            "event_date",
-            "event_hour",
-            "platform",
-            "app_version",
-            "ip_hash",
-            "device_category",
-            "prev_event_type",
-            "next_event_type",
-            "event_rank_per_user",
-            "seconds_since_last_event",
-            "computed_session_id",
-            "session_event_count",
-            "session_start",
-            "session_end",
-            "session_duration_seconds",
-            "session_distinct_event_types",
-            "session_entry_event",
-            "session_exit_event",
-        ]
-        output_df = with_session_stats.select(
-            [c for c in final_columns if c in with_session_stats.columns]
+        # ---- Write Session Aggregates (side output) ----
+        session_aggs = compute_session_aggregates(df)
+        session_output = args.output_path.rstrip("/") + "_sessions"
+        optimize_and_write(
+            session_aggs, session_output,
+            partition_cols=["session_country"],
+            target_partitions=50,
+            file_format=args.format,
         )
-        rows = write_output(output_df, args.output_path, args.output_format)
 
-        # 10. Optionally write pivot summary
-        pivot_path = args.output_path.rstrip("/") + "_pivot_summary"
-        pivot_df = pivot_event_counts(enriched)
-        pivot_df.write.mode("overwrite").format("parquet").save(pivot_path)
-        logger.info("Pivot summary written to %s", pivot_path)
+        # ---- Write Pivot Table (side output) ----
+        pivot_df = compute_event_type_pivot(df)
+        pivot_output = args.output_path.rstrip("/") + "_pivots"
+        optimize_and_write(
+            pivot_df, pivot_output,
+            partition_cols=["event_date"],
+            target_partitions=10,
+            file_format=args.format,
+        )
 
-        # Unpersist
-        enriched.unpersist()
-
-        logger.info("Transformation pipeline complete — %d rows", rows)
+        elapsed = time.time() - start_time
+        logger.info(
+            "Transformation complete. Input: %d, Output: %d, Duration: %.1fs.",
+            input_count, records_written, elapsed,
+        )
 
     except Exception:
-        logger.exception("Fatal error during transformation")
+        logger.exception("Transformation job failed.")
         sys.exit(1)
     finally:
         spark.stop()
-        logger.info("SparkSession stopped")
 
 
 if __name__ == "__main__":

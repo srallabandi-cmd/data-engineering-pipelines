@@ -1,43 +1,39 @@
 """
-Confluent Schema Registry Client
-=================================
+Schema Registry Client
 
-Production client for the Confluent Schema Registry supporting:
-- Schema registration (Avro and JSON Schema)
-- Schema retrieval by subject and version
-- Compatibility checks before registration
-- Schema evolution management
-- Caching for repeated lookups
+Manages schema registration, evolution validation, versioning, and caching
+for Avro and JSON schemas. Wraps the Confluent Schema Registry REST API.
+
+Features:
+- Register new schemas (Avro and JSON)
+- Schema evolution validation (BACKWARD, FORWARD, FULL, NONE)
+- Thread-safe local schema cache
+- Version management (get specific or latest)
+- Compatibility checking before registration
 
 Usage:
-    from schema_registry import SchemaRegistryClient
+    from schema_registry import SchemaRegistryClient, SchemaType
 
-    client = SchemaRegistryClient("http://localhost:8081")
-    schema_id = client.register_schema("user-events-value", avro_schema)
-    schema = client.get_latest_schema("user-events-value")
+    client = SchemaRegistryClient("http://schema-registry:8081")
+    schema_id = client.register_schema("events-value", avro_schema, SchemaType.AVRO)
+    is_compatible = client.check_compatibility("events-value", new_schema)
 """
 
 import json
 import logging
-import sys
+import threading
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger("schema_registry")
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Enums
+# Types
 # ---------------------------------------------------------------------------
 class SchemaType(str, Enum):
     AVRO = "AVRO"
@@ -46,299 +42,410 @@ class SchemaType(str, Enum):
 
 
 class CompatibilityLevel(str, Enum):
+    NONE = "NONE"
     BACKWARD = "BACKWARD"
     BACKWARD_TRANSITIVE = "BACKWARD_TRANSITIVE"
     FORWARD = "FORWARD"
     FORWARD_TRANSITIVE = "FORWARD_TRANSITIVE"
     FULL = "FULL"
     FULL_TRANSITIVE = "FULL_TRANSITIVE"
-    NONE = "NONE"
+
+
+class SchemaRegistryError(Exception):
+    """Base exception for Schema Registry operations."""
+
+    def __init__(self, message: str, error_code: Optional[int] = None, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.status_code = status_code
+
+
+class SchemaNotFoundError(SchemaRegistryError):
+    pass
+
+
+class IncompatibleSchemaError(SchemaRegistryError):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+class SchemaCache:
+    """Thread-safe in-memory schema cache."""
+
+    def __init__(self):
+        self._by_id: Dict[int, Dict[str, Any]] = {}
+        self._by_subject_version: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self._latest_by_subject: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get_by_id(self, schema_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self._by_id.get(schema_id)
+
+    def get_by_subject_version(self, subject: str, version: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self._by_subject_version.get((subject, version))
+
+    def get_latest(self, subject: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self._latest_by_subject.get(subject)
+
+    def put(self, schema_id: int, subject: str, version: int, schema: Dict[str, Any]) -> None:
+        with self._lock:
+            entry = {
+                "schema_id": schema_id,
+                "subject": subject,
+                "version": version,
+                "schema": schema,
+            }
+            self._by_id[schema_id] = entry
+            self._by_subject_version[(subject, version)] = entry
+            # Update latest if this version is newer
+            current_latest = self._latest_by_subject.get(subject)
+            if current_latest is None or version > current_latest["version"]:
+                self._latest_by_subject[subject] = entry
+
+    def invalidate(self, subject: Optional[str] = None) -> None:
+        with self._lock:
+            if subject is None:
+                self._by_id.clear()
+                self._by_subject_version.clear()
+                self._latest_by_subject.clear()
+            else:
+                self._latest_by_subject.pop(subject, None)
+                keys_to_remove = [k for k in self._by_subject_version if k[0] == subject]
+                for key in keys_to_remove:
+                    entry = self._by_subject_version.pop(key, None)
+                    if entry:
+                        self._by_id.pop(entry["schema_id"], None)
 
 
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
 class SchemaRegistryClient:
-    """Client for the Confluent Schema Registry REST API."""
+    """
+    Client for the Confluent Schema Registry.
+
+    Provides schema registration, retrieval, compatibility checking,
+    and version management with local caching.
+    """
 
     def __init__(
         self,
         url: str,
         auth: Optional[Tuple[str, str]] = None,
-        timeout: float = 10.0,
-    ) -> None:
-        self._url = url.rstrip("/")
-        self._auth = auth
-        self._timeout = timeout
-        self._headers = {
+        timeout: int = 30,
+        max_retries: int = 3,
+        cache_enabled: bool = True,
+    ):
+        self.url = url.rstrip("/")
+        self.timeout = timeout
+        self._cache = SchemaCache() if cache_enabled else None
+
+        self._session = requests.Session()
+        if auth:
+            self._session.auth = auth
+
+        retry = Retry(total=max_retries, backoff_factor=0.5, status_forcelist=[500, 502, 503])
+        adapter = HTTPAdapter(max_retries=retry)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+
+        self._session.headers.update({
             "Content-Type": "application/vnd.schemaregistry.v1+json",
             "Accept": "application/vnd.schemaregistry.v1+json",
-        }
-        # Cache: subject -> {version -> (schema_id, schema_str)}
-        self._cache: Dict[str, Dict[int, Tuple[int, str]]] = {}
-        logger.info("SchemaRegistryClient initialised: url=%s", self._url)
+        })
 
-    # ----- helpers --------------------------------------------------------
+        logger.info("SchemaRegistryClient initialized: url=%s", self.url)
 
-    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
-        url = f"{self._url}{path}"
-        response = requests.request(
-            method,
-            url,
-            headers=self._headers,
-            auth=self._auth,
-            timeout=self._timeout,
-            **kwargs,
-        )
-        if response.status_code >= 400:
-            logger.error(
-                "Schema Registry %s %s returned %d: %s",
-                method.upper(),
-                path,
-                response.status_code,
-                response.text,
+    def _request(self, method: str, path: str, body: Optional[dict] = None) -> Dict[str, Any]:
+        """Make an HTTP request to the Schema Registry."""
+        url = f"{self.url}{path}"
+        try:
+            response = self._session.request(
+                method, url, json=body, timeout=self.timeout,
             )
-        response.raise_for_status()
-        return response
+        except requests.exceptions.RequestException as exc:
+            raise SchemaRegistryError(f"Request failed: {exc}") from exc
 
-    # ----- Subjects -------------------------------------------------------
+        if response.status_code == 404:
+            data = response.json() if response.content else {}
+            raise SchemaNotFoundError(
+                data.get("message", "Not found"),
+                error_code=data.get("error_code"),
+                status_code=404,
+            )
+
+        if response.status_code == 409:
+            data = response.json() if response.content else {}
+            raise IncompatibleSchemaError(
+                data.get("message", "Schema is incompatible"),
+                error_code=data.get("error_code"),
+                status_code=409,
+            )
+
+        if response.status_code >= 400:
+            data = response.json() if response.content else {}
+            raise SchemaRegistryError(
+                data.get("message", f"HTTP {response.status_code}"),
+                error_code=data.get("error_code"),
+                status_code=response.status_code,
+            )
+
+        return response.json() if response.content else {}
+
+    # ---- Subjects --------------------------------------------------------
 
     def list_subjects(self) -> List[str]:
         """List all registered subjects."""
-        response = self._request("GET", "/subjects")
-        subjects = response.json()
-        logger.info("Found %d subjects", len(subjects))
-        return subjects
+        return self._request("GET", "/subjects")
 
     def delete_subject(self, subject: str, permanent: bool = False) -> List[int]:
-        """Delete a subject (soft or permanent)."""
-        params = {"permanent": "true"} if permanent else {}
-        response = self._request("DELETE", f"/subjects/{subject}", params=params)
-        return response.json()
+        """Delete a subject and all its versions."""
+        path = f"/subjects/{subject}"
+        if permanent:
+            path += "?permanent=true"
+        result = self._request("DELETE", path)
+        if self._cache:
+            self._cache.invalidate(subject)
+        return result
 
-    # ----- Registration ---------------------------------------------------
+    # ---- Registration ----------------------------------------------------
 
     def register_schema(
         self,
         subject: str,
-        schema_str: str,
+        schema: str,
         schema_type: SchemaType = SchemaType.AVRO,
         references: Optional[List[Dict[str, str]]] = None,
     ) -> int:
-        """Register a new schema under the given subject.
-
-        Returns the schema ID assigned by the registry.
         """
-        payload: Dict[str, Any] = {
-            "schema": schema_str,
+        Register a schema under a subject.
+
+        Returns the schema ID. If the schema already exists, returns the existing ID.
+        """
+        body = {
+            "schema": schema,
             "schemaType": schema_type.value,
         }
         if references:
-            payload["references"] = references
+            body["references"] = references
 
-        response = self._request(
-            "POST", f"/subjects/{subject}/versions", json=payload
-        )
-        schema_id = response.json()["id"]
-        logger.info(
-            "Registered schema: subject=%s type=%s id=%d",
-            subject,
-            schema_type.value,
-            schema_id,
-        )
+        result = self._request("POST", f"/subjects/{subject}/versions", body)
+        schema_id = result["id"]
+
+        logger.info("Registered schema for '%s': id=%d, type=%s", subject, schema_id, schema_type.value)
+
+        if self._cache:
+            self._cache.invalidate(subject)
+
         return schema_id
 
-    # ----- Retrieval ------------------------------------------------------
+    # ---- Retrieval -------------------------------------------------------
 
-    def get_schema_by_id(self, schema_id: int) -> str:
-        """Retrieve a schema by its global ID."""
-        response = self._request("GET", f"/schemas/ids/{schema_id}")
-        return response.json()["schema"]
+    def get_schema_by_id(self, schema_id: int) -> Dict[str, Any]:
+        """Get a schema by its global ID."""
+        if self._cache:
+            cached = self._cache.get_by_id(schema_id)
+            if cached:
+                return cached["schema"]
 
-    def get_latest_schema(self, subject: str) -> Dict[str, Any]:
-        """Get the latest version of a schema for a subject.
+        result = self._request("GET", f"/schemas/ids/{schema_id}")
+        return result
 
-        Returns a dict with keys: subject, version, id, schema, schemaType.
+    def get_schema(self, subject: str, version: str = "latest") -> Dict[str, Any]:
         """
-        response = self._request("GET", f"/subjects/{subject}/versions/latest")
-        data = response.json()
+        Get a specific version of a schema for a subject.
 
-        # Cache
-        version = data["version"]
-        self._cache.setdefault(subject, {})[version] = (
-            data["id"],
-            data["schema"],
-        )
+        Parameters
+        ----------
+        subject : str
+            Subject name (e.g., "events-value").
+        version : str or int
+            Schema version number or "latest".
+        """
+        if self._cache and version == "latest":
+            cached = self._cache.get_latest(subject)
+            if cached:
+                return cached
 
-        logger.info(
-            "Retrieved latest schema: subject=%s version=%d id=%d",
-            subject,
-            version,
-            data["id"],
-        )
-        return data
+        result = self._request("GET", f"/subjects/{subject}/versions/{version}")
 
-    def get_schema_by_version(self, subject: str, version: int) -> Dict[str, Any]:
-        """Get a specific version of a schema for a subject."""
-        # Check cache first
-        if subject in self._cache and version in self._cache[subject]:
-            schema_id, schema_str = self._cache[subject][version]
-            return {
-                "subject": subject,
-                "version": version,
-                "id": schema_id,
-                "schema": schema_str,
-            }
+        if self._cache:
+            self._cache.put(
+                schema_id=result["id"],
+                subject=subject,
+                version=result["version"],
+                schema=result,
+            )
 
-        response = self._request(
-            "GET", f"/subjects/{subject}/versions/{version}"
-        )
-        data = response.json()
+        return result
 
-        self._cache.setdefault(subject, {})[version] = (
-            data["id"],
-            data["schema"],
-        )
-        return data
+    def get_versions(self, subject: str) -> List[int]:
+        """Get all version numbers for a subject."""
+        return self._request("GET", f"/subjects/{subject}/versions")
 
-    def get_all_versions(self, subject: str) -> List[int]:
-        """List all version numbers for a subject."""
-        response = self._request("GET", f"/subjects/{subject}/versions")
-        return response.json()
+    def get_latest_version(self, subject: str) -> Dict[str, Any]:
+        """Get the latest schema version for a subject."""
+        return self.get_schema(subject, "latest")
 
-    # ----- Compatibility --------------------------------------------------
+    # ---- Compatibility ---------------------------------------------------
 
     def check_compatibility(
         self,
         subject: str,
-        schema_str: str,
+        schema: str,
         schema_type: SchemaType = SchemaType.AVRO,
         version: str = "latest",
+        verbose: bool = True,
     ) -> bool:
-        """Check if a schema is compatible with a specific version.
+        """
+        Check if a schema is compatible with the specified version.
 
         Returns True if compatible, False otherwise.
         """
-        payload = {
-            "schema": schema_str,
+        body = {
+            "schema": schema,
             "schemaType": schema_type.value,
         }
+
+        path = f"/compatibility/subjects/{subject}/versions/{version}"
+        if verbose:
+            path += "?verbose=true"
+
         try:
-            response = self._request(
-                "POST",
-                f"/compatibility/subjects/{subject}/versions/{version}",
-                json=payload,
-            )
-            is_compatible = response.json().get("is_compatible", False)
-            logger.info(
-                "Compatibility check: subject=%s version=%s compatible=%s",
-                subject,
-                version,
-                is_compatible,
-            )
-            return is_compatible
-        except requests.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 404:
-                logger.info(
-                    "No existing schema for subject=%s — compatibility check N/A",
-                    subject,
+            result = self._request("POST", path, body)
+            is_compatible = result.get("is_compatible", False)
+
+            if not is_compatible and verbose:
+                messages = result.get("messages", [])
+                logger.warning(
+                    "Schema incompatible for '%s': %s", subject, messages,
                 )
-                return True
-            raise
+
+            return is_compatible
+
+        except SchemaNotFoundError:
+            # No existing schema -- always compatible
+            return True
 
     def get_compatibility_level(self, subject: Optional[str] = None) -> str:
-        """Get the compatibility level (global or per-subject)."""
-        path = f"/config/{subject}" if subject else "/config"
-        response = self._request("GET", path)
-        return response.json().get("compatibilityLevel", "UNKNOWN")
+        """Get the compatibility level for a subject or the global default."""
+        if subject:
+            path = f"/config/{subject}"
+        else:
+            path = "/config"
+
+        result = self._request("GET", path)
+        return result.get("compatibilityLevel", "NONE")
 
     def set_compatibility_level(
         self,
         level: CompatibilityLevel,
         subject: Optional[str] = None,
     ) -> str:
-        """Set the compatibility level (global or per-subject)."""
-        path = f"/config/{subject}" if subject else "/config"
-        payload = {"compatibility": level.value}
-        response = self._request("PUT", path, json=payload)
-        result = response.json().get("compatibility", "UNKNOWN")
+        """
+        Set the compatibility level for a subject or globally.
+
+        Parameters
+        ----------
+        level : CompatibilityLevel
+            NONE, BACKWARD, FORWARD, FULL, or their TRANSITIVE variants.
+        subject : str, optional
+            If None, sets the global default.
+        """
+        if subject:
+            path = f"/config/{subject}"
+        else:
+            path = "/config"
+
+        body = {"compatibility": level.value}
+        result = self._request("PUT", path, body)
+
         logger.info(
-            "Set compatibility: subject=%s level=%s",
-            subject or "GLOBAL",
-            result,
+            "Set compatibility level: subject=%s, level=%s",
+            subject or "GLOBAL", level.value,
         )
-        return result
 
-    # ----- Convenience: register with compatibility pre-check -------------
+        return result.get("compatibility", level.value)
 
-    def safe_register(
+    # ---- Convenience Methods ---------------------------------------------
+
+    def register_avro_schema(self, subject: str, schema_dict: Dict[str, Any]) -> int:
+        """Register an Avro schema from a Python dictionary."""
+        schema_str = json.dumps(schema_dict)
+        return self.register_schema(subject, schema_str, SchemaType.AVRO)
+
+    def register_json_schema(self, subject: str, schema_dict: Dict[str, Any]) -> int:
+        """Register a JSON schema from a Python dictionary."""
+        schema_str = json.dumps(schema_dict)
+        return self.register_schema(subject, schema_str, SchemaType.JSON)
+
+    def evolve_schema(
         self,
         subject: str,
-        schema_str: str,
+        new_schema: str,
         schema_type: SchemaType = SchemaType.AVRO,
-    ) -> int:
-        """Check compatibility before registering; raise on incompatibility."""
-        if not self.check_compatibility(subject, schema_str, schema_type):
-            raise ValueError(
-                f"Schema is not compatible with subject '{subject}'. "
-                "Update the schema or change the compatibility level."
-            )
-        return self.register_schema(subject, schema_str, schema_type)
+        compatibility_override: Optional[CompatibilityLevel] = None,
+    ) -> Optional[int]:
+        """
+        Evolve a schema: check compatibility, then register if compatible.
+
+        Optionally override compatibility level for this operation.
+
+        Returns the new schema ID if registered, None if incompatible.
+        """
+        original_level = None
+
+        try:
+            if compatibility_override:
+                original_level = self.get_compatibility_level(subject)
+                self.set_compatibility_level(compatibility_override, subject)
+
+            if self.check_compatibility(subject, new_schema, schema_type):
+                schema_id = self.register_schema(subject, new_schema, schema_type)
+                logger.info("Schema evolved for '%s': new id=%d", subject, schema_id)
+                return schema_id
+            else:
+                logger.warning("Schema evolution rejected for '%s': incompatible.", subject)
+                return None
+
+        finally:
+            if original_level and compatibility_override:
+                self.set_compatibility_level(CompatibilityLevel(original_level), subject)
+
+    def close(self) -> None:
+        """Close the HTTP session."""
+        self._session.close()
 
 
 # ---------------------------------------------------------------------------
-# Example schemas
+# Predefined Schemas
 # ---------------------------------------------------------------------------
-USER_EVENT_AVRO_SCHEMA = json.dumps(
-    {
-        "type": "record",
-        "name": "UserEvent",
-        "namespace": "com.example.events",
-        "fields": [
-            {"name": "event_id", "type": "string"},
-            {"name": "user_id", "type": "string"},
-            {"name": "event_type", "type": "string"},
-            {"name": "event_timestamp", "type": "string"},
-            {
-                "name": "event_properties",
-                "type": ["null", {"type": "map", "values": "string"}],
-                "default": None,
-            },
-            {"name": "session_id", "type": ["null", "string"], "default": None},
-            {"name": "platform", "type": ["null", "string"], "default": None},
-            {"name": "app_version", "type": ["null", "string"], "default": None},
-        ],
-    }
-)
-
-USER_EVENT_JSON_SCHEMA = json.dumps(
-    {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "UserEvent",
-        "type": "object",
-        "required": ["event_id", "user_id", "event_type", "event_timestamp"],
-        "properties": {
-            "event_id": {"type": "string"},
-            "user_id": {"type": "string"},
-            "event_type": {
-                "type": "string",
-                "enum": [
-                    "page_view",
-                    "click",
-                    "purchase",
-                    "signup",
-                    "logout",
-                    "search",
-                    "add_to_cart",
-                    "remove_from_cart",
-                    "checkout",
-                ],
-            },
-            "event_timestamp": {"type": "string", "format": "date-time"},
-            "event_properties": {"type": "object"},
-            "session_id": {"type": ["string", "null"]},
-            "platform": {"type": ["string", "null"]},
-            "app_version": {"type": ["string", "null"]},
-        },
-    }
-)
+EVENTS_AVRO_SCHEMA = {
+    "type": "record",
+    "name": "Event",
+    "namespace": "com.dataengineering.events",
+    "fields": [
+        {"name": "event_id", "type": "string"},
+        {"name": "event_type", "type": {"type": "enum", "name": "EventType", "symbols": [
+            "page_view", "click", "scroll", "purchase", "signup", "login", "logout",
+        ]}},
+        {"name": "user_id", "type": ["null", "string"], "default": None},
+        {"name": "session_id", "type": ["null", "string"], "default": None},
+        {"name": "timestamp", "type": "string"},
+        {"name": "page_url", "type": ["null", "string"], "default": None},
+        {"name": "referrer_url", "type": ["null", "string"], "default": None},
+        {"name": "device_type", "type": ["null", "string"], "default": None},
+        {"name": "os", "type": ["null", "string"], "default": None},
+        {"name": "browser", "type": ["null", "string"], "default": None},
+        {"name": "country", "type": ["null", "string"], "default": None},
+        {"name": "city", "type": ["null", "string"], "default": None},
+        {"name": "duration_ms", "type": ["null", "long"], "default": None},
+        {"name": "revenue", "type": ["null", "double"], "default": None},
+        {"name": "is_conversion", "type": ["null", "boolean"], "default": None},
+    ],
+}

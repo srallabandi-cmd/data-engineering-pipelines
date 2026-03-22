@@ -1,109 +1,133 @@
-/*
-    fct_events
-    ==========
-    Events fact table at the event grain, enriched with:
-    - User dimension attributes (plan_type, country, user_segment)
-    - Session context (session_id, session_duration, entry/exit pages)
-    - Deduplication via row_number on event_id
+{{
+    config(
+        materialized='table',
+        unique_key='event_id',
+        tags=['marts', 'fact', 'events'],
+        partition_by={
+            'field': 'event_date',
+            'data_type': 'date',
+            'granularity': 'day'
+        },
+        cluster_by=['event_type', 'user_id'],
+        post_hook=[
+            "create index if not exists idx_fct_events_user on {{ this }} (user_id)",
+            "create index if not exists idx_fct_events_date on {{ this }} (event_date)",
+            "create index if not exists idx_fct_events_session on {{ this }} (session_id)"
+        ]
+    )
+}}
 
-    Grain: one row per unique event.
+/*
+    Fact Table: Events
+
+    Grain: one row per event occurrence.
+
+    Contains:
+    - Foreign keys to dimension tables (user_sk, session_id)
+    - Degenerate dimensions (event_type, device_type, browser, os)
+    - Measures (duration_ms, revenue)
+    - Computed metrics (is_conversion, event sequence in session)
+    - Timestamps for partitioning
 */
 
 with events as (
-    select * from {{ ref('stg_events') }}
-),
 
-users as (
-    select
-        user_id,
-        plan_type,
-        country,
-        user_segment,
-        signed_up_at,
-        is_active
-    from {{ ref('dim_users') }}
-    where is_current = true
+    select * from {{ ref('stg_events') }}
+
 ),
 
 sessions as (
+
     select * from {{ ref('int_user_sessions') }}
+
 ),
 
--- Deduplicate events (keep the earliest loaded record per event_id)
-deduplicated as (
+dim_users as (
+
     select
-        *,
-        row_number() over (
-            partition by event_id
-            order by loaded_at asc
-        ) as _row_num
-    from events
+        user_sk,
+        user_id
+    from {{ ref('dim_users') }}
+    where is_current = true
+
 ),
 
-unique_events as (
-    select * from deduplicated where _row_num = 1
-),
+-- Enrich events with session and dimension keys
+enriched_events as (
 
--- Map events to sessions by checking if the event timestamp falls within
--- a session's start/end boundaries for the same user.
-events_with_sessions as (
     select
-        e.*,
-        s.session_id,
-        s.session_duration_seconds,
-        s.session_event_count,
-        s.entry_page as session_entry_page,
-        s.exit_page as session_exit_page,
-        s.device_type as session_device_type
-    from unique_events e
-    left join sessions s
-        on e.user_id = s.user_id
-        and e.event_at >= s.session_started_at
-        and e.event_at <= s.session_ended_at
-),
-
--- Join with user dimension
-enriched as (
-    select
+        -- Primary key
         e.event_id,
-        e.user_id,
+
+        -- Foreign keys
+        coalesce(u.user_sk, {{ dbt_utils.generate_surrogate_key(["'unknown'"]) }}) as user_sk,
+        s.session_id,
+
+        -- Degenerate dimensions
         e.event_type,
-        e.event_at,
-        cast(e.event_at as date) as event_date,
-        extract(hour from e.event_at) as event_hour,
-        extract(dow from e.event_at) as event_day_of_week,
-        e.page_name,
-        e.referrer,
         e.device_type,
-        e.duration_seconds,
-        e.platform,
+        e.os,
+        e.browser,
+        e.country,
+        e.city,
+        e.page_url,
+        e.referrer_url,
+
+        -- Timestamps
+        e.event_timestamp,
+        e.event_date,
+        e.event_hour,
+        e.event_day_of_week,
+
+        -- Measures
+        e.duration_ms,
+        e.revenue,
+        e.is_conversion,
 
         -- Session context
-        e.session_id,
-        e.session_duration_seconds,
-        e.session_event_count,
-        e.session_entry_page,
-        e.session_exit_page,
+        s.session_category,
+        s.session_event_count,
+        s.session_duration_seconds,
 
-        -- User dimension
-        u.plan_type as user_plan_type,
-        u.country as user_country,
-        u.user_segment,
-        u.signed_up_at as user_signed_up_at,
-        u.is_active as user_is_active,
+        -- Event sequence within session
+        row_number() over (
+            partition by s.session_id
+            order by e.event_timestamp
+        ) as event_sequence_in_session,
 
-        -- Derived: is this user's first event?
-        case
-            when row_number() over (
-                partition by e.user_id order by e.event_at asc
-            ) = 1 then true
-            else false
-        end as is_first_event,
+        -- Previous and next event type (for funnel analysis)
+        lag(e.event_type) over (
+            partition by e.user_id
+            order by e.event_timestamp
+        ) as prev_event_type,
 
-        e.loaded_at
+        lead(e.event_type) over (
+            partition by e.user_id
+            order by e.event_timestamp
+        ) as next_event_type,
 
-    from events_with_sessions e
-    left join users u on e.user_id = u.user_id
+        -- Time between events
+        extract(epoch from (
+            e.event_timestamp - lag(e.event_timestamp) over (
+                partition by e.user_id
+                order by e.event_timestamp
+            )
+        )) as seconds_since_prev_event,
+
+        -- Metadata
+        e.properties_json,
+        e.ingested_at,
+        current_timestamp as dbt_updated_at
+
+    from events e
+
+    left join sessions s
+        on e.user_id = s.user_id
+        and e.event_timestamp between s.session_start_at and s.session_end_at
+
+    left join dim_users u
+        on e.user_id = u.user_id
+
 )
 
-select * from enriched
+select * from enriched_events

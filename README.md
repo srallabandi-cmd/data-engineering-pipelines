@@ -1,125 +1,128 @@
 # Data Engineering Pipelines
 
-Production-grade data engineering platform featuring PySpark ETL, Airflow orchestration, dbt transformations, and real-time streaming with Kafka. Built for scalability, reliability, and observability.
+[![PySpark](https://img.shields.io/badge/PySpark-3.5-E25A1C?logo=apachespark&logoColor=white)](https://spark.apache.org/)
+[![Airflow](https://img.shields.io/badge/Airflow-2.8-017CEE?logo=apacheairflow&logoColor=white)](https://airflow.apache.org/)
+[![dbt](https://img.shields.io/badge/dbt-1.7-FF694B?logo=dbt&logoColor=white)](https://www.getdbt.com/)
+[![Kafka](https://img.shields.io/badge/Kafka-3.6-231F20?logo=apachekafka&logoColor=white)](https://kafka.apache.org/)
+[![Great Expectations](https://img.shields.io/badge/Great_Expectations-0.18-FF6310)](https://greatexpectations.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
----
+Production-grade data engineering platform featuring batch and streaming ETL pipelines, data quality validation, dimensional modeling, and ML workflow orchestration.
 
-## Pipeline Architecture
+## Architecture
 
 ```mermaid
-graph LR
+flowchart LR
     subgraph Sources
-        A1[REST APIs]
-        A2[Databases]
-        A3[Event Streams]
+        API[REST APIs]
+        DB[(OLTP Databases)]
+        S3[Cloud Storage]
+        IOT[IoT Devices]
     end
 
     subgraph Ingestion
-        B[Apache Kafka]
+        KP[Kafka Producer]
+        SR[Schema Registry]
+        KT[Kafka Topics]
     end
 
     subgraph Processing
-        C1[Spark Batch ETL]
-        C2[Spark Structured Streaming]
+        SSC[Spark Structured Streaming]
+        SE[Spark Batch ETL]
+        DQ[Data Quality Checks]
     end
 
     subgraph Storage
-        D[Delta Lake]
+        DL[(Delta Lake)]
+        STG[Staging Layer]
+        PROC[Processed Layer]
     end
 
     subgraph Transformation
-        E[dbt Models]
+        DBT_STG[dbt Staging Models]
+        DBT_INT[dbt Intermediate Models]
+        DBT_MART[dbt Marts]
     end
 
     subgraph Serving
-        F[Data Warehouse]
-    end
-
-    subgraph Consumption
-        G1[BI Tools]
-        G2[ML Models]
-        G3[Analytics]
+        DW[(Data Warehouse)]
+        DASH[Dashboards]
+        ML[ML Models]
     end
 
     subgraph Orchestration
-        H[Apache Airflow]
+        AF[Airflow DAGs]
+        MON[Monitoring & Alerts]
     end
 
-    subgraph Quality
-        I[Great Expectations]
-    end
-
-    A1 --> B
-    A2 --> C1
-    A3 --> B
-    B --> C2
-    C1 --> D
-    C2 --> D
-    D --> E
-    E --> F
-    F --> G1
-    F --> G2
-    F --> G3
-    H -.->|orchestrates| C1
-    H -.->|orchestrates| E
-    H -.->|orchestrates| I
-    I -.->|validates| D
-    I -.->|validates| F
+    API --> KP
+    DB --> KP
+    S3 --> SE
+    IOT --> KP
+    KP --> SR
+    KP --> KT
+    KT --> SSC
+    SSC --> DL
+    SE --> STG
+    STG --> DQ
+    DQ --> PROC
+    PROC --> DBT_STG
+    DL --> DBT_STG
+    DBT_STG --> DBT_INT
+    DBT_INT --> DBT_MART
+    DBT_MART --> DW
+    DW --> DASH
+    DW --> ML
+    AF --> SE
+    AF --> DQ
+    AF --> DBT_STG
+    AF --> MON
 ```
-
-## Tech Stack
-
-| Component          | Technology                          |
-|--------------------|-------------------------------------|
-| Batch Processing   | Apache Spark 3.5 (PySpark)          |
-| Stream Processing  | Spark Structured Streaming + Kafka  |
-| Orchestration      | Apache Airflow 2.8                  |
-| Transformation     | dbt-core 1.7                        |
-| Storage            | Delta Lake 2.4                      |
-| Data Quality       | Great Expectations 0.18             |
-| Message Broker     | Apache Kafka 3.6                    |
-| Schema Management  | Confluent Schema Registry           |
-| Object Storage     | MinIO (S3-compatible)               |
-| Containerization   | Docker & Docker Compose             |
 
 ## Features
 
-- **Batch ETL**: PySpark jobs for extracting data from REST APIs and databases, applying complex transformations (window functions, sessionization, pivoting), and loading into Delta Lake with MERGE/upsert semantics.
-- **Stream Processing**: Spark Structured Streaming consumers reading from Kafka topics with watermarking, windowed aggregations, and exactly-once Delta Lake writes.
-- **Orchestration**: Airflow DAGs for daily ETL, data quality checks, and ML pipelines with SLA monitoring, Slack alerts, and task groups.
-- **dbt Transformations**: Layered models (staging, intermediate, marts) with sessionization logic, SCD Type 2 dimensions, and comprehensive schema tests.
-- **Data Quality**: Great Expectations suites and custom quality framework with null checks, uniqueness, referential integrity, regex patterns, and statistical anomaly detection.
-- **Schema Registry**: Confluent Schema Registry integration for Avro/JSON schema management with compatibility enforcement.
-- **CI/CD**: GitHub Actions workflow for linting, testing, dbt compilation, and Docker validation.
+- **Batch ETL**: PySpark jobs with API extraction, complex transformations, and warehouse loading
+- **Streaming**: Kafka producers, Spark Structured Streaming consumers with exactly-once semantics
+- **Schema Management**: Confluent Schema Registry with schema evolution (BACKWARD, FORWARD, FULL)
+- **Data Quality**: Great Expectations suites, custom PySpark validation framework, freshness and anomaly checks
+- **Orchestration**: Airflow DAGs for daily ETL, data quality, and ML pipelines with Slack alerting
+- **Dimensional Modeling**: dbt models across staging, intermediate, and marts layers with SCD Type 2
+- **CI/CD**: GitHub Actions for linting, testing, dbt compilation, and Docker build verification
+- **Local Development**: Full Docker Compose stack with Kafka, Spark, PostgreSQL, MinIO, and Airflow
 
 ## Prerequisites
 
-- Docker and Docker Compose (v2.20+)
+- Docker and Docker Compose v2.20+
 - Python 3.10+
-- Java 11 (for Spark)
-- Make
+- Java 11 (for local Spark)
+- GNU Make
 
-## Getting Started
+## Quick Start
 
 ```bash
 # Clone the repository
-git clone https://github.com/srallabandi-cmd/data-engineering-pipelines.git
+git clone https://github.com/<your-org>/data-engineering-pipelines.git
 cd data-engineering-pipelines
 
-# Start all services (Spark, Kafka, Airflow, PostgreSQL, Redis, MinIO)
-docker-compose up -d
+# Start the full local stack
+make setup
+make docker-up
 
-# Install Python dependencies
-pip install -r requirements.txt
+# Create Kafka topics
+make kafka-topics
 
-# Install dbt dependencies
-cd dbt && dbt deps && cd ..
+# Run the batch ETL pipeline
+make spark-submit JOB=spark-jobs/etl/extract_api_data.py
 
-# Verify setup
+# Run dbt models
+make dbt-run
+
+# Run tests
 make test
-```
 
-The Airflow UI will be available at `http://localhost:8080` (admin/admin).
+# Tear down
+make docker-down
+```
 
 ## Project Structure
 
@@ -128,84 +131,109 @@ data-engineering-pipelines/
 ├── spark-jobs/
 │   ├── etl/
 │   │   ├── extract_api_data.py       # API extraction with retry logic
-│   │   ├── transform_events.py       # PySpark transformations
-│   │   └── load_warehouse.py         # Delta Lake upsert loading
+│   │   ├── transform_events.py       # Complex PySpark transformations
+│   │   └── load_warehouse.py         # Warehouse loading with upsert/SCD
 │   └── utils/
-│       ├── spark_session.py           # SparkSession builder
-│       └── data_quality.py            # Custom quality framework
+│       ├── spark_session.py           # Spark session builder
+│       └── data_quality.py            # Custom DQ framework
 ├── airflow/
 │   ├── dags/
 │   │   ├── daily_etl_pipeline.py      # Main ETL orchestration
-│   │   ├── data_quality_checks.py     # Quality validation DAG
-│   │   └── ml_pipeline_dag.py         # ML training pipeline
+│   │   ├── data_quality_checks.py     # Post-ETL quality checks
+│   │   └── ml_pipeline_dag.py         # ML training and deployment
 │   ├── plugins/
 │   │   └── custom_operators.py        # Custom Airflow operators
-│   └── docker-compose.yml             # Local Airflow deployment
+│   └── docker-compose.yml             # Local Airflow environment
 ├── dbt/
-│   ├── models/
-│   │   ├── staging/                   # Raw data cleaning
-│   │   ├── intermediate/             # Business logic
-│   │   └── marts/                    # Final dimensions & facts
-│   ├── macros/                       # Custom macros & tests
 │   ├── dbt_project.yml
-│   └── profiles.yml
+│   ├── profiles.yml
+│   ├── models/
+│   │   ├── staging/
+│   │   │   ├── stg_events.sql
+│   │   │   ├── stg_users.sql
+│   │   │   └── schema.yml
+│   │   ├── intermediate/
+│   │   │   ├── int_user_sessions.sql
+│   │   │   └── schema.yml
+│   │   └── marts/
+│   │       ├── dim_users.sql
+│   │       ├── fct_events.sql
+│   │       └── schema.yml
+│   └── macros/
+│       ├── generate_schema_name.sql
+│       └── test_macros.sql
 ├── data-quality/
 │   └── great_expectations/
-│       ├── expectations/             # Expectation suites
-│       └── checkpoints/              # Validation checkpoints
+│       ├── expectations/
+│       │   └── events_suite.json
+│       └── checkpoints/
+│           └── daily_checkpoint.yml
 ├── streaming/
-│   ├── kafka_producer.py             # Kafka event producer
-│   ├── spark_streaming_consumer.py   # Structured Streaming consumer
-│   └── schema_registry.py           # Schema Registry client
-├── tests/                            # Unit and integration tests
-├── docker-compose.yml                # Full local dev stack
-├── Makefile                          # Development commands
-├── requirements.txt                  # Python dependencies
-└── .github/workflows/
-    └── test-pipelines.yml            # CI/CD pipeline
+│   ├── kafka_producer.py
+│   ├── spark_streaming_consumer.py
+│   └── schema_registry.py
+├── .github/
+│   └── workflows/
+│       └── test-pipelines.yml
+├── docker-compose.yml                 # Full local dev stack
+├── Makefile
+├── .gitignore
+└── README.md
 ```
 
-## Running Tests
+## Components
 
-```bash
-# Run all tests
-make test
+### Spark ETL Jobs
 
-# Run specific test suite
-pytest tests/ -v --tb=short -k "test_transform"
+The `spark-jobs/` directory contains PySpark applications for batch and streaming workloads:
 
-# Run dbt tests only
-cd dbt && dbt test
+- **extract_api_data.py** - Extracts data from REST APIs with exponential backoff retry, pagination, rate limiting, and schema enforcement. Writes to the staging layer as Parquet.
+- **transform_events.py** - Applies complex transformations including window functions (lag, lead, row_number), session identification, pivot operations, UDFs, and data enrichment via joins.
+- **load_warehouse.py** - Loads processed data into the warehouse using Delta MERGE for upserts, SCD Type 2 dimension handling, and post-load validation with checksums.
 
-# Lint code
-make lint
-```
+### Airflow DAGs
 
-## Running the Pipeline
+- **daily_etl_pipeline.py** - Full orchestration: sensor for data arrival, extraction, Spark transformations, dbt run, quality checks, Slack notifications.
+- **data_quality_checks.py** - Post-ETL validation: Great Expectations checkpoints, SQL checks, freshness, volume anomalies.
+- **ml_pipeline_dag.py** - ML workflow: feature computation, training, evaluation, conditional deployment via BranchPythonOperator.
 
-```bash
-# Run batch ETL end-to-end
-make run-etl
+### dbt Models
 
-# Run dbt transformations
-make run-dbt
+Three-layer architecture following the dbt best practices:
 
-# Start streaming pipeline
-make run-streaming
+| Layer | Purpose | Materialization |
+|-------|---------|-----------------|
+| **Staging** | Source cleaning, type casting, dedup | Incremental |
+| **Intermediate** | Business logic, sessionization | Ephemeral / Table |
+| **Marts** | Dimensions and facts for analytics | Table |
 
-# Or use Airflow to orchestrate everything
-# Navigate to http://localhost:8080 and enable the daily_etl_pipeline DAG
-```
+### Streaming
+
+- **kafka_producer.py** - Produces events to Kafka with JSON schema validation, delivery guarantees, and key-based partitioning.
+- **spark_streaming_consumer.py** - Consumes from Kafka with watermarking, window aggregations, and Delta Lake output.
+- **schema_registry.py** - Manages Avro/JSON schemas with compatibility enforcement.
+
+## Configuration
+
+All credentials and environment-specific configuration are managed via environment variables. See `.env.example` for the full list. Never commit secrets.
+
+| Variable | Description |
+|----------|-------------|
+| `SPARK_MASTER` | Spark cluster URL |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker addresses |
+| `WAREHOUSE_JDBC_URL` | Data warehouse JDBC connection |
+| `S3_ENDPOINT` | S3-compatible storage endpoint |
+| `AIRFLOW__CORE__EXECUTOR` | Airflow executor type |
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Write tests for your changes
-4. Ensure all tests pass (`make test`) and code is formatted (`make lint`)
+3. Write tests for new functionality
+4. Ensure all quality checks pass (`make lint && make test`)
 5. Commit your changes following [Conventional Commits](https://www.conventionalcommits.org/)
-6. Push to your branch and open a Pull Request
+6. Open a pull request with a clear description
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+This project is licensed under the MIT License.

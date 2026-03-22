@@ -1,54 +1,80 @@
-# Great Expectations Checkpoint Configuration
-# Runs the events_suite against the events Delta Lake table.
+# Great Expectations Daily Checkpoint
 #
-# Usage:
-#   great_expectations checkpoint run daily_checkpoint
+# Validates the events dataset after the daily ETL pipeline completes.
+# Runs the events_suite expectations and triggers store + Slack notifications.
 
 name: daily_checkpoint
 config_version: 1.0
+
 template_name: null
 module_name: great_expectations.checkpoint
 class_name: Checkpoint
-run_name_template: "daily_run_%Y%m%d_%H%M%S"
 
-expectation_suite_name: null
+run_name_template: "daily_events_%Y%m%d_%H%M%S"
 
-validations:
-  - batch_request:
-      datasource_name: spark_delta_datasource
-      data_connector_name: default_runtime_data_connector_name
-      data_asset_name: events
-      runtime_parameters:
-        path: "s3a://data-warehouse/events"
-      batch_identifiers:
-        default_identifier_name: daily_batch
-    expectation_suite_name: events_suite
+expectation_suite_name: null  # Specified per validation below
 
 action_list:
+  # Store validation results in the configured results store
   - name: store_validation_result
     action:
       class_name: StoreValidationResultAction
 
+  # Store evaluation parameters for cross-validation reference
   - name: store_evaluation_params
     action:
       class_name: StoreEvaluationParametersAction
 
+  # Update Data Docs (HTML reports) after each validation
   - name: update_data_docs
     action:
       class_name: UpdateDataDocsAction
+      site_names:
+        - local_site
+        - s3_site
 
-  - name: send_slack_notification
+  # Send Slack notification on failure
+  - name: send_slack_notification_on_failure
     action:
       class_name: SlackNotificationAction
-      module_name: great_expectations.checkpoint.actions
-      slack_webhook: "${SLACK_WEBHOOK_URL}"
+      slack_webhook: ${SLACK_GE_WEBHOOK_URL}
       notify_on: failure
       notify_with:
-        - data_docs_local_site
+        - local_site
       renderer:
         module_name: great_expectations.render.renderer.slack_renderer
         class_name: SlackRenderer
 
-evaluation_parameters: {}
-runtime_configuration: {}
-profilers: []
+  # Send email notification on failure
+  - name: send_email_on_failure
+    action:
+      class_name: EmailAction
+      notify_on: failure
+      use_tls: true
+      use_ssl: false
+      smtp_address: ${SMTP_HOST}
+      smtp_port: ${SMTP_PORT}
+      sender_login: ${SMTP_USER}
+      sender_password: ${SMTP_PASSWORD}
+      sender_alias: "Great Expectations"
+      receiver_emails: "data-alerts@example.com"
+
+validations:
+  # Validation 1: Events dataset
+  - batch_request:
+      datasource_name: warehouse_datasource
+      data_connector_name: default_runtime_data_connector
+      data_asset_name: events
+      runtime_parameters:
+        query: >
+          SELECT *
+          FROM warehouse.events
+          WHERE ingestion_date = CURRENT_DATE - INTERVAL '1 day'
+      batch_identifiers:
+        default_identifier_name: daily_events
+    expectation_suite_name: events_suite
+
+evaluation_parameters:
+  # Pass parameters that can be used in expectations
+  execution_date: ${EXECUTION_DATE}
+  environment: ${PIPELINE_ENV}

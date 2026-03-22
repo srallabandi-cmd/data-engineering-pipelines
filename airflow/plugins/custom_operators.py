@@ -1,22 +1,21 @@
 """
 Custom Airflow Operators
-========================
 
-Production-ready custom operators for the data engineering platform:
-
-- DataQualityOperator: Runs data quality checks and raises on failure.
-- SparkDeltaOperator: Submits Spark jobs with Delta Lake configuration.
-- SlackAlertOperator: Sends formatted Slack notifications.
+Provides reusable operators for the data engineering platform:
+- DataQualityOperator: Runs PySpark-based quality checks with fail thresholds
+- SparkDeltaOperator: Submits Spark jobs pre-configured for Delta Lake
+- SlackAlertOperator: Sends formatted Slack messages with full DAG context
 """
 
 import json
 import logging
-import subprocess
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
+from airflow.exceptions import AirflowException
 from airflow.models import BaseOperator, Variable
-from airflow.utils.decorators import apply_defaults
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from airflow.providers.slack.operators.slack_webhook import SlackWebhookOperator
+from airflow.utils.context import Context
 
 logger = logging.getLogger(__name__)
 
@@ -25,122 +24,119 @@ logger = logging.getLogger(__name__)
 # DataQualityOperator
 # ---------------------------------------------------------------------------
 class DataQualityOperator(BaseOperator):
-    """Run data quality checks against a Delta Lake table and raise on failure.
+    """
+    Run data quality checks using the PySpark data quality framework.
+
+    Connects to the data source, runs all configured checks, and fails
+    the task if the number of critical failures exceeds the threshold.
 
     Parameters
     ----------
     table_path : str
-        Path to the Delta Lake table to validate.
+        Path to the Delta/Parquet table to validate.
     checks : list of dict
-        Each dict has keys: ``column``, ``check_type`` (null, unique, range,
-        row_count), and check-specific parameters.
-    fail_on_error : bool
-        Whether to raise an ``AirflowFailException`` on check failure.
+        Each dict defines a check: {type, column, params, severity}.
+        Supported types: null_check, uniqueness_check, range_check,
+        row_count_check, accepted_values_check.
+    fail_threshold : int
+        Maximum allowed critical failures before the task fails (default: 0).
+    spark_conn_id : str
+        Airflow connection ID for Spark.
+    date_filter : str, optional
+        Filter the table to a specific date (column: ingestion_date).
     """
 
-    template_fields = ("table_path",)
-    ui_color = "#e8f7e4"
+    template_fields: Sequence[str] = ("table_path", "date_filter")
+    ui_color = "#FFCC00"
+    ui_fgcolor = "#000000"
 
-    @apply_defaults
     def __init__(
         self,
         table_path: str,
         checks: List[Dict[str, Any]],
-        fail_on_error: bool = True,
+        fail_threshold: int = 0,
+        spark_conn_id: str = "spark_default",
+        date_filter: Optional[str] = None,
         **kwargs,
-    ) -> None:
+    ):
         super().__init__(**kwargs)
         self.table_path = table_path
         self.checks = checks
-        self.fail_on_error = fail_on_error
+        self.fail_threshold = fail_threshold
+        self.spark_conn_id = spark_conn_id
+        self.date_filter = date_filter
 
-    def execute(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        from pyspark.sql import SparkSession
+    def execute(self, context: Context) -> Dict[str, Any]:
+        import sys
+        sys.path.insert(0, "/opt/spark-jobs/utils")
+
+        from spark_session import SparkSessionBuilder
+        from data_quality import DataQualityRunner, Severity
         from pyspark.sql import functions as F
 
-        spark = SparkSession.builder.appName(
-            f"dq_{self.task_id}"
-        ).getOrCreate()
+        spark = SparkSessionBuilder(app_name=f"DQ_{self.task_id}").with_delta().with_s3().build()
 
         try:
             df = spark.read.format("delta").load(self.table_path)
-            total_rows = df.count()
-            results: List[Dict[str, Any]] = []
+            if self.date_filter:
+                df = df.filter(F.col("ingestion_date") == self.date_filter)
 
-            for check_def in self.checks:
-                column = check_def.get("column")
-                check_type = check_def["check_type"]
+            runner = DataQualityRunner(spark, df, table_name=self.table_path)
 
-                if check_type == "null":
-                    max_pct = check_def.get("max_null_pct", 0.0)
-                    null_count = df.filter(F.col(column).isNull()).count()
-                    null_pct = null_count / total_rows if total_rows else 1.0
-                    passed = null_pct <= max_pct
-                    results.append({
-                        "check": f"null_{column}",
-                        "passed": passed,
-                        "metric": round(null_pct, 6),
-                        "threshold": max_pct,
-                    })
-
-                elif check_type == "unique":
-                    distinct = df.select(column).distinct().count()
-                    dups = total_rows - distinct
-                    passed = dups == 0
-                    results.append({
-                        "check": f"unique_{column}",
-                        "passed": passed,
-                        "metric": dups,
-                        "threshold": 0,
-                    })
-
-                elif check_type == "range":
-                    min_val = check_def.get("min_val")
-                    max_val = check_def.get("max_val")
-                    cond = F.lit(False)
-                    if min_val is not None:
-                        cond = cond | (F.col(column) < min_val)
-                    if max_val is not None:
-                        cond = cond | (F.col(column) > max_val)
-                    violations = df.filter(F.col(column).isNotNull()).filter(cond).count()
-                    passed = violations == 0
-                    results.append({
-                        "check": f"range_{column}",
-                        "passed": passed,
-                        "metric": violations,
-                        "threshold": f"[{min_val}, {max_val}]",
-                    })
-
-                elif check_type == "row_count":
-                    min_rows = check_def.get("min_rows", 1)
-                    passed = total_rows >= min_rows
-                    results.append({
-                        "check": "row_count",
-                        "passed": passed,
-                        "metric": total_rows,
-                        "threshold": min_rows,
-                    })
-
-            all_passed = all(r["passed"] for r in results)
-            report = {
-                "table_path": self.table_path,
-                "total_rows": total_rows,
-                "results": results,
-                "all_passed": all_passed,
+            severity_map = {
+                "critical": Severity.CRITICAL,
+                "warning": Severity.WARNING,
+                "info": Severity.INFO,
             }
 
-            logger.info("Quality report: %s", json.dumps(report, indent=2))
-            context["task_instance"].xcom_push(
-                key="quality_report", value=json.dumps(report)
-            )
+            for check in self.checks:
+                check_type = check["type"]
+                column = check.get("column")
+                params = check.get("params", {})
+                severity = severity_map.get(check.get("severity", "critical"), Severity.CRITICAL)
 
-            if not all_passed and self.fail_on_error:
-                failures = [r for r in results if not r["passed"]]
-                raise RuntimeError(
-                    f"Data quality checks failed: {json.dumps(failures)}"
+                if check_type == "null_check":
+                    runner.add_null_check(column, threshold=params.get("threshold", 0.0), severity=severity)
+                elif check_type == "uniqueness_check":
+                    runner.add_uniqueness_check(column, severity=severity)
+                elif check_type == "range_check":
+                    runner.add_range_check(
+                        column,
+                        min_val=params.get("min_val"),
+                        max_val=params.get("max_val"),
+                        severity=severity,
+                    )
+                elif check_type == "row_count_check":
+                    runner.add_row_count_check(
+                        min_count=params.get("min_count", 1),
+                        max_count=params.get("max_count"),
+                        severity=severity,
+                    )
+                elif check_type == "accepted_values_check":
+                    runner.add_accepted_values_check(
+                        column,
+                        accepted_values=params.get("values", []),
+                        severity=severity,
+                    )
+                else:
+                    logger.warning("Unknown check type: %s. Skipping.", check_type)
+
+            report = runner.run()
+
+            # Push report to XCom
+            context["task_instance"].xcom_push(key="quality_report", value=report.to_json())
+            context["task_instance"].xcom_push(key="quality_summary", value=json.dumps(report.summary()))
+
+            logger.info("Quality report summary: %s", json.dumps(report.summary()))
+
+            if report.critical_failures > self.fail_threshold:
+                raise AirflowException(
+                    f"Data quality check failed: {report.critical_failures} critical failures "
+                    f"(threshold: {self.fail_threshold}). "
+                    f"Report: {report.to_json()}"
                 )
 
-            return report
+            return report.summary()
 
         finally:
             spark.stop()
@@ -149,163 +145,197 @@ class DataQualityOperator(BaseOperator):
 # ---------------------------------------------------------------------------
 # SparkDeltaOperator
 # ---------------------------------------------------------------------------
-class SparkDeltaOperator(BaseOperator):
-    """Submit a Spark job with Delta Lake configuration pre-applied.
+class SparkDeltaOperator(SparkSubmitOperator):
+    """
+    Submit a Spark job pre-configured with Delta Lake dependencies.
+
+    Extends SparkSubmitOperator to automatically include Delta Lake
+    packages, configurations, and environment-specific settings.
 
     Parameters
     ----------
     application : str
-        Path to the PySpark script.
-    application_args : list of str
-        Arguments passed to the Spark application.
-    spark_conf : dict, optional
-        Additional Spark configuration key-value pairs.
-    executor_memory : str
-        Executor memory (default: 4g).
-    driver_memory : str
-        Driver memory (default: 2g).
-    num_executors : int
-        Number of executors (default: 2).
-    packages : str
-        Comma-separated Maven coordinates of packages.
+        Path to the Spark application (.py file).
+    environment : str
+        Target environment (local, dev, prod). Controls resource allocation.
+    extra_spark_conf : dict, optional
+        Additional Spark configuration to merge.
+    delta_version : str
+        Delta Lake package version (default: 3.1.0).
     """
 
-    template_fields = ("application", "application_args")
-    ui_color = "#d4e6f1"
+    template_fields: Sequence[str] = SparkSubmitOperator.template_fields + ("environment",)
+    ui_color = "#FF6600"
 
-    DELTA_PACKAGES = "io.delta:delta-core_2.12:2.4.0"
-    DELTA_CONF = {
-        "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension",
-        "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-        "spark.sql.adaptive.enabled": "true",
-        "spark.databricks.delta.schema.autoMerge.enabled": "true",
+    _ENV_RESOURCES = {
+        "local": {
+            "spark.driver.memory": "2g",
+            "spark.executor.memory": "2g",
+            "spark.executor.cores": "2",
+            "spark.executor.instances": "1",
+            "spark.sql.shuffle.partitions": "8",
+        },
+        "dev": {
+            "spark.driver.memory": "4g",
+            "spark.executor.memory": "4g",
+            "spark.executor.cores": "2",
+            "spark.executor.instances": "2",
+            "spark.sql.shuffle.partitions": "50",
+        },
+        "prod": {
+            "spark.driver.memory": "8g",
+            "spark.executor.memory": "16g",
+            "spark.executor.cores": "4",
+            "spark.executor.instances": "10",
+            "spark.sql.shuffle.partitions": "400",
+            "spark.sql.adaptive.enabled": "true",
+            "spark.dynamicAllocation.enabled": "true",
+        },
     }
 
-    @apply_defaults
     def __init__(
         self,
         application: str,
-        application_args: Optional[List[str]] = None,
-        spark_conf: Optional[Dict[str, str]] = None,
-        executor_memory: str = "4g",
-        driver_memory: str = "2g",
-        num_executors: int = 2,
-        packages: Optional[str] = None,
+        environment: str = "prod",
+        extra_spark_conf: Optional[Dict[str, str]] = None,
+        delta_version: str = "3.1.0",
         **kwargs,
-    ) -> None:
-        super().__init__(**kwargs)
-        self.application = application
-        self.application_args = application_args or []
-        self.spark_conf = spark_conf or {}
-        self.executor_memory = executor_memory
-        self.driver_memory = driver_memory
-        self.num_executors = num_executors
-        self.packages = packages or self.DELTA_PACKAGES
+    ):
+        self.environment = environment
 
-    def execute(self, context: Dict[str, Any]) -> str:
-        merged_conf = {**self.DELTA_CONF, **self.spark_conf}
+        # Build Delta Lake configuration
+        delta_conf = {
+            "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension",
+            "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+            "spark.databricks.delta.schema.autoMerge.enabled": "true",
+            "spark.databricks.delta.properties.defaults.autoOptimize.optimizeWrite": "true",
+        }
 
-        cmd = [
-            "spark-submit",
-            "--packages", self.packages,
-            "--executor-memory", self.executor_memory,
-            "--driver-memory", self.driver_memory,
-            "--num-executors", str(self.num_executors),
-        ]
+        # Merge env resources
+        env_conf = self._ENV_RESOURCES.get(environment, self._ENV_RESOURCES["prod"])
+        merged_conf = {**env_conf, **delta_conf}
+        if extra_spark_conf:
+            merged_conf.update(extra_spark_conf)
 
-        for key, value in merged_conf.items():
-            cmd.extend(["--conf", f"{key}={value}"])
+        # Merge with any user-provided conf
+        user_conf = kwargs.pop("conf", {}) or {}
+        merged_conf.update(user_conf)
 
-        cmd.append(self.application)
-        cmd.extend(self.application_args)
+        # Set packages for Delta Lake
+        packages = kwargs.pop("packages", None)
+        if packages is None:
+            packages = f"io.delta:delta-spark_2.12:{delta_version}"
 
-        logger.info("Running: %s", " ".join(cmd))
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
+        super().__init__(
+            application=application,
+            conf=merged_conf,
+            packages=packages,
+            **kwargs,
         )
 
-        if result.returncode != 0:
-            logger.error("Spark job failed:\nSTDOUT: %s\nSTDERR: %s", result.stdout[-2000:], result.stderr[-2000:])
-            raise RuntimeError(
-                f"Spark job {self.application} failed with exit code {result.returncode}"
-            )
-
-        logger.info("Spark job completed successfully")
-        return result.stdout[-500:]
+    def execute(self, context: Context):
+        logger.info(
+            "Submitting Spark Delta job: app=%s, env=%s",
+            self.application, self.environment,
+        )
+        return super().execute(context)
 
 
 # ---------------------------------------------------------------------------
 # SlackAlertOperator
 # ---------------------------------------------------------------------------
 class SlackAlertOperator(BaseOperator):
-    """Send a formatted Slack notification.
+    """
+    Send a formatted Slack message with full DAG execution context.
+
+    Automatically includes DAG ID, task ID, execution date, run duration,
+    and any custom message. Supports success, failure, and warning styles.
 
     Parameters
     ----------
-    message_template : str
-        Message template with ``{dag_id}``, ``{task_id}``, ``{execution_date}``,
-        ``{status}``, and ``{details}`` placeholders.
-    status : str
-        One of ``success``, ``failure``, ``warning``, ``info``.
-    details : str, optional
-        Extra details to include in the message.
-    slack_conn_id : str
-        Airflow connection ID for the Slack webhook.
+    slack_webhook_conn_id : str
+        Airflow connection ID for Slack webhook.
+    message : str
+        Custom message body.
+    alert_type : str
+        One of 'success', 'failure', 'warning', 'info'.
+    include_log_link : bool
+        Whether to include a link to the task log (default: True).
+    extra_fields : dict, optional
+        Additional key-value pairs to include in the message.
     """
 
-    template_fields = ("message_template", "details")
-    ui_color = "#fce4ec"
+    template_fields: Sequence[str] = ("message", "alert_type")
+    ui_color = "#4A154B"
 
-    STATUS_EMOJI = {
+    _EMOJI_MAP = {
         "success": ":white_check_mark:",
         "failure": ":red_circle:",
         "warning": ":warning:",
         "info": ":information_source:",
     }
 
-    @apply_defaults
+    _TITLE_MAP = {
+        "success": "Success",
+        "failure": "Failure",
+        "warning": "Warning",
+        "info": "Information",
+    }
+
     def __init__(
         self,
-        message_template: Optional[str] = None,
-        status: str = "info",
-        details: str = "",
-        slack_conn_id: Optional[str] = None,
+        slack_webhook_conn_id: str = "slack_webhook",
+        message: str = "",
+        alert_type: str = "info",
+        include_log_link: bool = True,
+        extra_fields: Optional[Dict[str, str]] = None,
         **kwargs,
-    ) -> None:
+    ):
         super().__init__(**kwargs)
-        self.message_template = message_template or (
-            "{emoji} *Pipeline {status}*\n"
-            "*DAG:* `{dag_id}`\n"
-            "*Task:* `{task_id}`\n"
-            "*Date:* {execution_date}\n"
-            "{details}"
+        self.slack_webhook_conn_id = slack_webhook_conn_id
+        self.message = message
+        self.alert_type = alert_type
+        self.include_log_link = include_log_link
+        self.extra_fields = extra_fields or {}
+
+    def execute(self, context: Context) -> None:
+        ti = context.get("task_instance")
+        dag_id = context.get("dag").dag_id
+        task_id = ti.task_id
+        execution_date = context.get("execution_date")
+        dag_run = context.get("dag_run")
+
+        emoji = self._EMOJI_MAP.get(self.alert_type, ":speech_balloon:")
+        title = self._TITLE_MAP.get(self.alert_type, "Alert")
+
+        # Build message blocks
+        lines = [
+            f"{emoji} *{title}*",
+            f"*DAG:* `{dag_id}`",
+            f"*Task:* `{task_id}`",
+            f"*Execution Date:* `{execution_date}`",
+        ]
+
+        if dag_run and dag_run.start_date and dag_run.end_date:
+            duration = dag_run.end_date - dag_run.start_date
+            lines.append(f"*Duration:* `{duration}`")
+
+        if self.message:
+            lines.append(f"*Message:* {self.message}")
+
+        for key, value in self.extra_fields.items():
+            lines.append(f"*{key}:* `{value}`")
+
+        if self.include_log_link and ti:
+            lines.append(f"<{ti.log_url}|View Logs>")
+
+        full_message = "\n".join(lines)
+
+        slack = SlackWebhookOperator(
+            task_id=f"{self.task_id}_slack_inner",
+            slack_webhook_conn_id=self.slack_webhook_conn_id,
+            message=full_message,
         )
-        self.status = status
-        self.details = details
-        self.slack_conn_id = slack_conn_id or Variable.get(
-            "slack_conn_id", default_var="slack_default"
-        )
+        slack.execute(context=context)
 
-    def execute(self, context: Dict[str, Any]) -> None:
-        from airflow.providers.slack.operators.slack_webhook import SlackWebhookOperator
-
-        emoji = self.STATUS_EMOJI.get(self.status, ":grey_question:")
-        message = self.message_template.format(
-            emoji=emoji,
-            status=self.status.upper(),
-            dag_id=context["dag"].dag_id,
-            task_id=self.task_id,
-            execution_date=context["ds"],
-            details=self.details,
-        )
-
-        SlackWebhookOperator(
-            task_id=f"slack_alert_{self.task_id}",
-            slack_webhook_conn_id=self.slack_conn_id,
-            message=message,
-        ).execute(context=context)
-
-        logger.info("Slack alert sent: status=%s", self.status)
+        logger.info("Slack %s alert sent for %s.%s", self.alert_type, dag_id, task_id)
