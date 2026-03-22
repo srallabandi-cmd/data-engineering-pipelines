@@ -1,0 +1,214 @@
+{
+  "expectation_suite_name": "events_suite",
+  "ge_cloud_id": null,
+  "data_asset_type": "Dataset",
+  "meta": {
+    "great_expectations_version": "0.18.8",
+    "created_by": "data-engineering-pipelines",
+    "notes": "Production expectation suite for the events Delta Lake table."
+  },
+  "expectations": [
+    {
+      "expectation_type": "expect_table_columns_to_match_set",
+      "kwargs": {
+        "column_set": [
+          "event_id",
+          "user_id",
+          "event_type",
+          "event_ts",
+          "event_date",
+          "event_hour",
+          "platform",
+          "app_version",
+          "ip_hash",
+          "device_category",
+          "computed_session_id",
+          "session_event_count",
+          "session_duration_seconds"
+        ],
+        "exact_match": false
+      },
+      "meta": {
+        "notes": "Ensure all expected columns are present."
+      }
+    },
+    {
+      "expectation_type": "expect_table_row_count_to_be_between",
+      "kwargs": {
+        "min_value": 1,
+        "max_value": null
+      },
+      "meta": {
+        "notes": "Table must not be empty."
+      }
+    },
+    {
+      "expectation_type": "expect_column_to_exist",
+      "kwargs": {
+        "column": "event_id"
+      }
+    },
+    {
+      "expectation_type": "expect_column_to_exist",
+      "kwargs": {
+        "column": "user_id"
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "kwargs": {
+        "column": "event_id"
+      },
+      "meta": {
+        "notes": "Primary key must never be null."
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "kwargs": {
+        "column": "user_id"
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "kwargs": {
+        "column": "event_type"
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "kwargs": {
+        "column": "event_ts"
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_not_be_null",
+      "kwargs": {
+        "column": "event_date"
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_unique",
+      "kwargs": {
+        "column": "event_id"
+      },
+      "meta": {
+        "notes": "event_id is the primary key and must be unique."
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_of_type",
+      "kwargs": {
+        "column": "event_id",
+        "type_": "StringType"
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_of_type",
+      "kwargs": {
+        "column": "event_ts",
+        "type_": "TimestampType"
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_of_type",
+      "kwargs": {
+        "column": "event_hour",
+        "type_": "IntegerType"
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_in_set",
+      "kwargs": {
+        "column": "event_type",
+        "value_set": [
+          "page_view",
+          "click",
+          "purchase",
+          "signup",
+          "logout",
+          "search",
+          "add_to_cart",
+          "remove_from_cart",
+          "checkout"
+        ]
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_in_set",
+      "kwargs": {
+        "column": "device_category",
+        "value_set": [
+          "mobile",
+          "desktop",
+          "tablet",
+          "bot",
+          "unknown"
+        ]
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_in_set",
+      "kwargs": {
+        "column": "platform",
+        "value_set": [
+          "web",
+          "ios",
+          "android",
+          null
+        ]
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_between",
+      "kwargs": {
+        "column": "event_hour",
+        "min_value": 0,
+        "max_value": 23
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_between",
+      "kwargs": {
+        "column": "session_duration_seconds",
+        "min_value": 0,
+        "max_value": 86400,
+        "mostly": 0.99
+      },
+      "meta": {
+        "notes": "Session duration should be between 0 and 24 hours."
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_be_between",
+      "kwargs": {
+        "column": "session_event_count",
+        "min_value": 1,
+        "max_value": 10000,
+        "mostly": 0.99
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_match_regex",
+      "kwargs": {
+        "column": "ip_hash",
+        "regex": "^[a-f0-9]{16}$",
+        "mostly": 0.95
+      },
+      "meta": {
+        "notes": "IP hash should be a 16-char hex string."
+      }
+    },
+    {
+      "expectation_type": "expect_column_values_to_match_regex",
+      "kwargs": {
+        "column": "computed_session_id",
+        "regex": "^.+_\\d+$",
+        "mostly": 0.99
+      },
+      "meta": {
+        "notes": "Session ID format: user_id + '_' + session_index."
+      }
+    }
+  ]
+}

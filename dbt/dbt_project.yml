@@ -1,0 +1,57 @@
+name: 'data_engineering_pipelines'
+version: '1.0.0'
+config-version: 2
+
+profile: 'data_engineering_pipelines'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+clean-targets: ["target", "dbt_packages"]
+
+vars:
+  raw_database: "analytics"
+  start_date: "2024-01-01"
+
+models:
+  data_engineering_pipelines:
+    +materialized: view
+
+    staging:
+      +materialized: view
+      +schema: staging
+      +tags: ['staging', 'daily']
+
+    intermediate:
+      +materialized: table
+      +schema: intermediate
+      +tags: ['intermediate', 'daily']
+
+    marts:
+      +materialized: table
+      +schema: marts
+      +tags: ['marts', 'daily']
+      dim_users:
+        +materialized: incremental
+        +unique_key: user_key
+        +incremental_strategy: merge
+      fct_events:
+        +materialized: incremental
+        +unique_key: event_id
+        +incremental_strategy: merge
+        +partition_by:
+          field: event_date
+          data_type: date
+          granularity: day
+
+seeds:
+  data_engineering_pipelines:
+    +schema: seeds
+    +quote_columns: true
+
+packages:
+  - package: dbt-labs/dbt_utils
+    version: "1.1.1"

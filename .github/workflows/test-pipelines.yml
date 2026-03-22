@@ -1,0 +1,104 @@
+name: Test Pipelines
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.10"
+  DBT_PROFILES_DIR: ./dbt
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install flake8 black
+
+      - name: Run flake8
+        run: flake8 spark-jobs/ streaming/ --max-line-length=120 --extend-ignore=E203,W503
+
+      - name: Run black (check mode)
+        run: black --check --line-length=120 spark-jobs/ streaming/
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest tests/ -v --tb=short --junitxml=reports/junit.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: reports/junit.xml
+
+  dbt:
+    name: dbt Compile & Test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dbt
+        run: |
+          pip install --upgrade pip
+          pip install dbt-core==1.7.0 dbt-databricks==1.7.0 dbt-utils
+
+      - name: Install dbt packages
+        run: cd dbt && dbt deps
+
+      - name: Compile dbt models
+        run: cd dbt && dbt compile --target dev
+        env:
+          DATABRICKS_HOST: "localhost"
+          DATABRICKS_HTTP_PATH: "/sql/1.0/warehouses/test"
+          DATABRICKS_TOKEN: "test_token"
+
+  docker-validate:
+    name: Validate Docker Compose
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate root docker-compose.yml
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Validate airflow docker-compose.yml
+        run: docker compose -f airflow/docker-compose.yml config --quiet

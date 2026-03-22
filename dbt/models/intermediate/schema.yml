@@ -1,0 +1,59 @@
+version: 2
+
+models:
+  - name: int_user_sessions
+    description: >
+      Sessionised user events using a 30-minute inactivity gap.
+      Each row represents a single session with aggregated metrics
+      such as duration, event count, and entry/exit pages.
+    columns:
+      - name: session_id
+        description: Deterministic session identifier (user_id + session_index).
+        tests:
+          - unique
+          - not_null
+
+      - name: user_id
+        description: User who owns this session.
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_users')
+              field: user_id
+
+      - name: session_started_at
+        description: Timestamp of the first event in the session.
+        tests:
+          - not_null
+
+      - name: session_ended_at
+        description: Timestamp of the last event in the session.
+        tests:
+          - not_null
+
+      - name: session_duration_seconds
+        description: Duration of the session in seconds.
+        tests:
+          - not_null
+
+      - name: session_event_count
+        description: Number of events in the session.
+        tests:
+          - not_null
+
+      - name: distinct_event_types
+        description: Number of distinct event types in the session.
+
+      - name: entry_page
+        description: First page visited in the session.
+
+      - name: exit_page
+        description: Last page visited in the session.
+
+      - name: device_type
+        description: Device type used during the session.
+
+      - name: session_date
+        description: Date of the session start (for partitioning).
+        tests:
+          - not_null

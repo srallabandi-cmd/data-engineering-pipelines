@@ -1,0 +1,141 @@
+version: 2
+
+sources:
+  - name: raw
+    description: Raw data ingested from the source systems via the Spark ETL pipeline.
+    database: "{{ var('raw_database', 'analytics') }}"
+    schema: raw
+    tables:
+      - name: events
+        description: Raw user interaction events from the events API.
+        columns:
+          - name: event_id
+            description: Unique identifier for each event.
+          - name: user_id
+            description: Identifier of the user who triggered the event.
+          - name: event_type
+            description: Type of event (e.g., page_view, click, purchase).
+          - name: event_timestamp
+            description: UTC timestamp when the event occurred.
+          - name: event_properties
+            description: JSON blob of event-specific properties.
+          - name: session_id
+            description: Client-generated session identifier.
+          - name: platform
+            description: Platform of the client (web, ios, android).
+          - name: app_version
+            description: Version of the application that emitted the event.
+          - name: _loaded_at
+            description: Timestamp when the record was loaded into the raw layer.
+
+      - name: users
+        description: Raw user profile data from the user service.
+        columns:
+          - name: user_id
+            description: Unique identifier for each user.
+          - name: email
+            description: User email address.
+          - name: first_name
+            description: User first name.
+          - name: last_name
+            description: User last name.
+          - name: signup_date
+            description: Date the user signed up.
+          - name: plan_type
+            description: Subscription plan (free, pro, enterprise).
+          - name: country
+            description: Two-letter country code.
+          - name: language
+            description: User preferred language.
+          - name: is_active
+            description: Whether the user account is active.
+          - name: is_verified
+            description: Whether the user email is verified.
+          - name: created_at
+            description: Record creation timestamp.
+          - name: updated_at
+            description: Record last update timestamp.
+          - name: _loaded_at
+            description: Timestamp when the record was loaded into the raw layer.
+
+models:
+  - name: stg_events
+    description: >
+      Cleaned and typed events from the raw events source.
+      Parses JSON properties, casts timestamps, and filters out null event_ids.
+    columns:
+      - name: event_id
+        description: Unique event identifier.
+        tests:
+          - unique
+          - not_null
+
+      - name: user_id
+        description: User who triggered the event.
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_users')
+              field: user_id
+
+      - name: event_type
+        description: Type of event.
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['page_view', 'click', 'purchase', 'signup', 'logout', 'search', 'add_to_cart', 'remove_from_cart', 'checkout']
+
+      - name: event_at
+        description: Parsed UTC timestamp of the event.
+        tests:
+          - not_null
+
+      - name: page_name
+        description: Page where the event occurred (extracted from properties).
+
+      - name: referrer
+        description: Referrer URL (extracted from properties).
+
+      - name: device_type
+        description: Device type (extracted from properties).
+
+      - name: duration_seconds
+        description: Duration of the event in seconds.
+
+      - name: loaded_at
+        description: Ingestion timestamp.
+        tests:
+          - not_null
+
+  - name: stg_users
+    description: >
+      Cleaned and typed user profiles from the raw users source.
+      Normalises email, trims whitespace, casts types, and filters null user_ids.
+    columns:
+      - name: user_id
+        description: Unique user identifier.
+        tests:
+          - unique
+          - not_null
+
+      - name: email
+        description: Normalised email address.
+        tests:
+          - unique
+          - not_null
+
+      - name: plan_type
+        description: Subscription plan.
+        tests:
+          - accepted_values:
+              values: ['free', 'pro', 'enterprise']
+
+      - name: signed_up_at
+        description: Date the user signed up.
+        tests:
+          - not_null
+
+      - name: is_active
+        description: Whether the account is active.
+        tests:
+          - not_null

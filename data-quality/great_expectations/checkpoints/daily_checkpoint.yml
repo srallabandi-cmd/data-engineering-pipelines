@@ -1,0 +1,54 @@
+# Great Expectations Checkpoint Configuration
+# Runs the events_suite against the events Delta Lake table.
+#
+# Usage:
+#   great_expectations checkpoint run daily_checkpoint
+
+name: daily_checkpoint
+config_version: 1.0
+template_name: null
+module_name: great_expectations.checkpoint
+class_name: Checkpoint
+run_name_template: "daily_run_%Y%m%d_%H%M%S"
+
+expectation_suite_name: null
+
+validations:
+  - batch_request:
+      datasource_name: spark_delta_datasource
+      data_connector_name: default_runtime_data_connector_name
+      data_asset_name: events
+      runtime_parameters:
+        path: "s3a://data-warehouse/events"
+      batch_identifiers:
+        default_identifier_name: daily_batch
+    expectation_suite_name: events_suite
+
+action_list:
+  - name: store_validation_result
+    action:
+      class_name: StoreValidationResultAction
+
+  - name: store_evaluation_params
+    action:
+      class_name: StoreEvaluationParametersAction
+
+  - name: update_data_docs
+    action:
+      class_name: UpdateDataDocsAction
+
+  - name: send_slack_notification
+    action:
+      class_name: SlackNotificationAction
+      module_name: great_expectations.checkpoint.actions
+      slack_webhook: "${SLACK_WEBHOOK_URL}"
+      notify_on: failure
+      notify_with:
+        - data_docs_local_site
+      renderer:
+        module_name: great_expectations.render.renderer.slack_renderer
+        class_name: SlackRenderer
+
+evaluation_parameters: {}
+runtime_configuration: {}
+profilers: []

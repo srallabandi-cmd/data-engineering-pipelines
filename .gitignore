@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.python-version
+
+# PySpark
+metastore_db/
+spark-warehouse/
+derby.log
+
+# Delta Lake
+_delta_log/
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/dbt_modules/
+
+# Great Expectations
+data-quality/great_expectations/uncommitted/
+data-quality/great_expectations/great_expectations.yml
+
+# Airflow
+airflow/logs/
+*.pid
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Credentials
+*.pem
+*.key
+credentials.json
+
+# Test / Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+reports/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Docker
+*.log

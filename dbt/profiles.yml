@@ -1,0 +1,30 @@
+data_engineering_pipelines:
+  target: dev
+  outputs:
+
+    dev:
+      type: databricks
+      catalog: dev_catalog
+      schema: analytics_dev
+      host: "{{ env_var('DATABRICKS_HOST', 'localhost') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH', '/sql/1.0/warehouses/dev') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN', 'dapi_dev_token') }}"
+      threads: 4
+
+    staging:
+      type: databricks
+      catalog: staging_catalog
+      schema: analytics_staging
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      threads: 8
+
+    prod:
+      type: databricks
+      catalog: prod_catalog
+      schema: analytics
+      host: "{{ env_var('DATABRICKS_HOST') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      threads: 16

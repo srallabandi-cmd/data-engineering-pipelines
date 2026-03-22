@@ -1,0 +1,104 @@
+version: 2
+
+models:
+  - name: dim_users
+    description: >
+      User dimension table with latest profile attributes, lifetime engagement
+      metrics, and user segmentation. Implements SCD Type 2 with valid_from
+      and valid_to columns. Filter on is_current = true for the latest snapshot.
+    columns:
+      - name: user_key
+        description: Surrogate key combining user_id and valid_from for SCD Type 2.
+        tests:
+          - unique
+          - not_null
+
+      - name: user_id
+        description: Natural key — unique user identifier.
+        tests:
+          - not_null
+
+      - name: email
+        description: Normalised user email address.
+        tests:
+          - not_null
+
+      - name: signed_up_at
+        description: Date the user signed up.
+        tests:
+          - not_null
+
+      - name: plan_type
+        description: Subscription plan (free, pro, enterprise).
+        tests:
+          - accepted_values:
+              values: ['free', 'pro', 'enterprise']
+
+      - name: user_segment
+        description: >
+          Computed user segment based on engagement metrics:
+          power_user, regular, casual, dormant.
+        tests:
+          - accepted_values:
+              values: ['power_user', 'regular', 'casual', 'dormant']
+
+      - name: lifetime_event_count
+        description: Total number of events triggered by this user.
+        tests:
+          - not_null
+
+      - name: lifetime_session_count
+        description: Total number of sessions for this user.
+        tests:
+          - not_null
+
+      - name: is_current
+        description: Whether this is the current version of the user record.
+        tests:
+          - not_null
+
+  - name: fct_events
+    description: >
+      Events fact table at the individual event grain. Each row represents
+      a single deduplicated event enriched with user dimension attributes
+      and session context. Use event_date for time-based filtering.
+    columns:
+      - name: event_id
+        description: Unique event identifier.
+        tests:
+          - unique
+          - not_null
+
+      - name: user_id
+        description: User who triggered the event.
+        tests:
+          - not_null
+
+      - name: event_type
+        description: Type of event.
+        tests:
+          - not_null
+
+      - name: event_at
+        description: UTC timestamp of the event.
+        tests:
+          - not_null
+
+      - name: event_date
+        description: Date of the event (for partitioning and filtering).
+        tests:
+          - not_null
+
+      - name: session_id
+        description: Session the event belongs to (from sessionisation logic).
+
+      - name: user_plan_type
+        description: User subscription plan at the time of the event.
+
+      - name: user_segment
+        description: User engagement segment at the time of the event.
+
+      - name: is_first_event
+        description: Whether this is the user's very first event.
+        tests:
+          - not_null
